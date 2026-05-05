@@ -1,5 +1,11 @@
 package org.rinha;
 
+import jdk.incubator.vector.ByteVector;
+import jdk.incubator.vector.IntVector;
+import jdk.incubator.vector.ShortVector;
+import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorSpecies;
+
 /**
  * Top-5 nearest-neighbor search.
  *
@@ -216,28 +222,37 @@ final class KnnSearch {
 
     // ── INT8 vector distance (static, for Phase 2 hot loop) ──────────────────
 
+    // Panama Vector API species — initialized once at class load.
+    // On x86+AVX2 the JIT emits a single VPMOVSX + VPMULLD + VPHADDD sequence;
+    // on ARM NEON it uses two 128-bit passes (still faster than 8 scalar iterations).
+    private static final VectorSpecies<Byte>    BYTE_SPEC  = ByteVector.SPECIES_64;
+    private static final VectorSpecies<Short>   SHORT_SPEC = ShortVector.SPECIES_128;
+    private static final VectorSpecies<Integer> INT_SPEC   = IntVector.SPECIES_256;
+
     /**
      * Squared Euclidean distance (INT8² scale) between {@code q} and the stored
      * vector at byte offset {@code base} in {@code vecs}, with early exit.
      *
-     * Static so the JIT can see {@code vecs} is a pure local parameter — no field
-     * dereference through a store object on each call.  {@code return} for early
-     * exit gives the JIT a single clean exit edge, unlike inlined {@code continue}
-     * which creates 13 backward branches to a compound for-update expression.
+     * Dims 0-7: Panama Vector API SIMD — B→S sign-extension, subtract as shorts
+     *   (max |diff| = 254, fits in short), S→I sign-extension, multiply as ints,
+     *   horizontal ADD reduce.  One SIMD burst replaces 8 scalar squarings.
+     * Dims 8-13: scalar early-termination (can't safely over-read the 14-byte q[]).
      *
      * Max result: (127+127)² × 14 = 903,224 — fits in int.
      */
     private static int distSqInt8(final byte[] q, final byte[] vecs,
                                   final int base, final int threshold) {
-        int sum = 0, d;
-        d = q[0]  - vecs[base];     sum += d*d; if (sum >= threshold) return sum;
-        d = q[1]  - vecs[base+1];   sum += d*d; if (sum >= threshold) return sum;
-        d = q[2]  - vecs[base+2];   sum += d*d; if (sum >= threshold) return sum;
-        d = q[3]  - vecs[base+3];   sum += d*d; if (sum >= threshold) return sum;
-        d = q[4]  - vecs[base+4];   sum += d*d; if (sum >= threshold) return sum;
-        d = q[5]  - vecs[base+5];   sum += d*d; if (sum >= threshold) return sum;
-        d = q[6]  - vecs[base+6];   sum += d*d; if (sum >= threshold) return sum;
-        d = q[7]  - vecs[base+7];   sum += d*d; if (sum >= threshold) return sum;
+        // Dims 0-7: SIMD
+        final ShortVector qS = (ShortVector) ByteVector.fromArray(BYTE_SPEC, q, 0)
+                .convertShape(VectorOperators.B2S, SHORT_SPEC, 0);
+        final ShortVector vS = (ShortVector) ByteVector.fromArray(BYTE_SPEC, vecs, base)
+                .convertShape(VectorOperators.B2S, SHORT_SPEC, 0);
+        final IntVector dI = (IntVector) qS.sub(vS)
+                .convertShape(VectorOperators.S2I, INT_SPEC, 0);
+        int sum = dI.mul(dI).reduceLanes(VectorOperators.ADD);
+        if (sum >= threshold) return sum;
+        // Dims 8-13: scalar
+        int d;
         d = q[8]  - vecs[base+8];   sum += d*d; if (sum >= threshold) return sum;
         d = q[9]  - vecs[base+9];   sum += d*d; if (sum >= threshold) return sum;
         d = q[10] - vecs[base+10];  sum += d*d; if (sum >= threshold) return sum;
