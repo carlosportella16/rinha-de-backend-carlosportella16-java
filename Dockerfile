@@ -36,15 +36,22 @@ CMD java \
     --add-opens java.base/sun.misc=ALL-UNNAMED \
     --sun-misc-unsafe-memory-access=allow \
     -XX:+UseSerialGC \
-    -Xms64m -Xmx64m \
+    -Xms100m -Xmx100m \
     -XX:+AlwaysPreTouch \
     -XX:+TieredCompilation \
-    -XX:CompileThreshold=1000 \
-    -XX:Tier4CompileThreshold=500 \
+    -XX:CompileThreshold=500 \
+    -XX:Tier4CompileThreshold=250 \
     -XX:+OptimizeStringConcat \
     -XX:+DoEscapeAnalysis \
     -XX:+EliminateAllocations \
     -XX:+DisableExplicitGC \
+    -XX:MetaspaceSize=24m \
+    -XX:MaxMetaspaceSize=48m \
+    -Xss256k \
+    -XX:+UseCompressedOops \
+    -XX:+UseCompressedClassPointers \
     -Dio.netty.allocator.type=pooled \
     -Dio.netty.recycler.maxCapacityPerThread=4096 \
+    -Dio.netty.allocator.numHeapArenas=2 \
+    -Dio.netty.allocator.numDirectArenas=1 \
     -cp /app/app.jar org.rinha.Main

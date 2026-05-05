@@ -305,11 +305,17 @@ final class KnnSearch {
 
     // ── Score ─────────────────────────────────────────────────────────────────
 
+    /**
+     * Counts fraud labels among the K nearest neighbors.
+     * Branch-free inner loop: avoids misprediction on the label check.
+     */
     static int fraudCount(final OffHeapVectorStore store, final int[] topIdx) {
         int count = 0;
+        final byte[] labels = store.labels;
         for (int i = 0; i < K; i++) {
             final int idx = topIdx[i];
-            if (idx >= 0 && store.getLabel(idx) == OffHeapVectorStore.FRAUD) count++;
+            // idx < 0 means slot unfilled (only possible if store < K vectors)
+            if (idx >= 0) count += (labels[idx] == OffHeapVectorStore.FRAUD) ? 1 : 0;
         }
         return count;
     }

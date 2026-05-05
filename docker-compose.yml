@@ -15,7 +15,7 @@ services:
       resources:
         limits:
           cpus: "0.05"
-          memory: "16MB"
+          memory: "12MB"
     networks:
       - rinha
 
@@ -24,6 +24,7 @@ services:
     environment:
       - VECTORS_BIN=/data/references.bin
       - SERVER_PORT=9998
+      - NPROBE=8
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9998/ready || exit 1"]
       interval: 5s
@@ -34,7 +35,7 @@ services:
       resources:
         limits:
           cpus: "0.475"
-          memory: "167MB"
+          memory: "169MB"
     networks:
       - rinha
 
@@ -43,6 +44,7 @@ services:
     environment:
       - VECTORS_BIN=/data/references.bin
       - SERVER_PORT=9998
+      - NPROBE=8
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9998/ready || exit 1"]
       interval: 5s
@@ -53,7 +55,7 @@ services:
       resources:
         limits:
           cpus: "0.475"
-          memory: "167MB"
+          memory: "169MB"
     networks:
       - rinha
 

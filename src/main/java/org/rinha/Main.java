@@ -78,8 +78,11 @@ public final class Main {
                 .group(boss, worker)
                 .channel(channelClass)
                 .option(ChannelOption.SO_BACKLOG, 1024)
+                .option(ChannelOption.SO_REUSEADDR, true)
                 .childOption(ChannelOption.TCP_NODELAY, true)
                 .childOption(ChannelOption.SO_KEEPALIVE, false)
+                .childOption(ChannelOption.SO_RCVBUF, 16384)
+                .childOption(ChannelOption.SO_SNDBUF, 16384)
                 // PooledByteBufAllocator: reuses buffer memory → less GC pressure
                 .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                 .childHandler(new ChannelInitializer<SocketChannel>() {
@@ -87,7 +90,9 @@ public final class Main {
                     protected void initChannel(SocketChannel ch) {
                         ch.pipeline()
                                 .addLast(new HttpServerCodec())
-                                .addLast(new HttpObjectAggregator(65536))
+                                // 8 KB max body size — real payloads are ~500 bytes;
+                                // smaller limit means less zeroing on buffer allocation
+                                .addLast(new HttpObjectAggregator(8192))
                                 .addLast(RequestHandler.INSTANCE);
                     }
                 })
@@ -116,6 +121,7 @@ public final class Main {
             t = System.currentTimeMillis();
             System.out.println("Running JIT warmup (10 000 queries)…");
             warmup(STORE);
+            warmupParser();
             System.out.printf("Warmup done in %d ms%n", System.currentTimeMillis() - t);
 
             READY = true;
@@ -153,6 +159,35 @@ public final class Main {
             KnnSearch.quantize(vec, vecInt8);
             KnnSearch.searchIVF(store, vec, vecInt8, topDist, topIdx, nprobe);
         }
+    }
+
+    /**
+     * Warm up the RequestParser's byte[] hot path so it is C2-compiled before
+     * the first real request arrives.  Uses a minimal but valid JSON body that
+     * exercises every code branch (hasLast=true and hasLast=false).
+     */
+    private static void warmupParser() {
+        // A minimal fraud-score body with last_transaction present
+        final String body =
+            "{\"transaction\":{\"amount\":100.0,\"installments\":1,"
+            + "\"requested_at\":\"2025-01-15T14:30:00Z\"},"
+            + "\"customer\":{\"avg_amount\":200.0,\"tx_count_24h\":3,"
+            + "\"known_merchants\":[\"merch-abc\"]},"
+            + "\"merchant\":{\"id\":\"merch-abc\",\"mcc\":\"5812\","
+            + "\"avg_amount\":150.0},"
+            + "\"terminal\":{\"is_online\":false,\"card_present\":true,"
+            + "\"km_from_home\":5.0},"
+            + "\"last_transaction\":{\"timestamp\":\"2025-01-15T12:00:00Z\","
+            + "\"km_from_current\":3.0}}";
+        final byte[] bytes = body.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+        final io.netty.buffer.ByteBuf buf =
+                io.netty.buffer.Unpooled.wrappedBuffer(bytes);
+        final float[] scratch = new float[VectorStore.DIMS];
+        for (int i = 0; i < 10_000; i++) {
+            buf.resetReaderIndex();
+            RequestParser.parse(buf, scratch);
+        }
+        buf.release();
     }
 
     @ChannelHandler.Sharable
