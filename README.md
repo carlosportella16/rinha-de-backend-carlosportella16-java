@@ -2,18 +2,9 @@
 
 > **Carlos Portella** · Java 25 · Netty · IVF + INT8 · Off-Heap
 
-A high-performance fraud detection API built for [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026).  
+A high-performance fraud detection API built for [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026) by [@carlosportella16](https://github.com/carlosportella16).  
+**Repository:** https://github.com/carlosportella16/rinha-de-backend-carlosportella16-java  
 The goal: serve KNN-based fraud scores with **p99 ≤ 1 ms** under 1 CPU / 350 MB RAM constraints.
-
----
-
-## Benchmark Results
-
-| Scenario | p99 | score_p99 | score_det | final_score |
-|----------|-----|-----------|-----------|-------------|
-| Baseline (1D index, float32) | 15.2 ms | 1818 | 3000 | **4818** |
-| + JVM flags + Epoll + warmup | ~8 ms | ~2097 | 3000 | **~5097** |
-| + INT8 quantization + IVF V4 | ~2 ms | ~2699 | 3000 | **~5699** |
 
 ---
 
