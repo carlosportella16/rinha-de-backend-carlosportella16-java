@@ -124,6 +124,8 @@ final class VectorLoader {
         store.numClusters   = C;
         store.defaultNprobe = nprobe;
 
+        store.buildBboxes(); // compute per-cluster INT8 bounding boxes
+
         return store;
     }
 
@@ -181,6 +183,8 @@ final class VectorLoader {
         store.listData      = listData;
         store.numClusters   = C;
         store.defaultNprobe = nprobe;
+
+        store.buildBboxes(); // compute per-cluster INT8 bounding boxes
 
         return store;
     }

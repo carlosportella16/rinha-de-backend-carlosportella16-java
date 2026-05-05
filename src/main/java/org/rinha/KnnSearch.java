@@ -96,9 +96,23 @@ final class KnnSearch {
         int worstInt = Integer.MAX_VALUE;
         final int[] listData = store.listData; // null for V4 (cluster-ordered)
 
+        // Bbox pruning arrays (null for V2 stores that have no IVF)
+        final byte[] bboxMin = store.bboxMinInt8;
+        final byte[] bboxMax = store.bboxMaxInt8;
+
         for (int p = 0; p < bound; p++) {
             final int c = probeIdx[p];
             if (c < 0) break;
+
+            // ── Bbox lower-bound pruning ───────────────────────────────────────
+            // Compute the minimum possible INT8² distance from the query to any
+            // vector inside this cluster.  If it already exceeds the current K-th
+            // worst, no vector here can enter top-K → skip the whole cluster.
+            if (bboxMin != null) {
+                final int lb = bboxLbInt8(queryInt8, bboxMin, bboxMax, c);
+                if (lb >= worstInt) continue;
+            }
+
             final int off = listOffsets[c];
             final int sz  = listSizes[c];
 
@@ -147,6 +161,48 @@ final class KnnSearch {
         final float d13 = q[13] - c[b+13];
         return d0*d0+d1*d1+d2*d2+d3*d3+d4*d4+d5*d5+d6*d6
               +d7*d7+d8*d8+d9*d9+d10*d10+d11*d11+d12*d12+d13*d13;
+    }
+
+    // ── Bbox lower-bound distance (INT8² scale, fully unrolled) ──────────────
+
+    /**
+     * Returns the minimum possible squared INT8 distance from the query vector
+     * to any vector inside cluster {@code c}.
+     *
+     * For each dimension d:
+     *   - if query[d] < bbox_min[d]:  contributes (bbox_min[d] - query[d])²
+     *   - if query[d] > bbox_max[d]:  contributes (query[d] - bbox_max[d])²
+     *   - otherwise: contributes 0
+     *
+     * Fully unrolled for DIMS=14 — JIT will keep this register-local and may
+     * auto-vectorize the 14 clamped-delta additions.
+     *
+     * Result fits in int (max = 14 × 254² = 903,224).
+     */
+    private static int bboxLbInt8(final byte[] q,
+                                   final byte[] bmin,
+                                   final byte[] bmax,
+                                   final int c) {
+        final int b = c * OffHeapVectorStore.DIMS;
+        int sum = 0;
+        int qi, lo, hi, diff;
+
+        qi=(int)q[0];  lo=(int)bmin[b];    hi=(int)bmax[b];    if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[1];  lo=(int)bmin[b+1];  hi=(int)bmax[b+1];  if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[2];  lo=(int)bmin[b+2];  hi=(int)bmax[b+2];  if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[3];  lo=(int)bmin[b+3];  hi=(int)bmax[b+3];  if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[4];  lo=(int)bmin[b+4];  hi=(int)bmax[b+4];  if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[5];  lo=(int)bmin[b+5];  hi=(int)bmax[b+5];  if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[6];  lo=(int)bmin[b+6];  hi=(int)bmax[b+6];  if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[7];  lo=(int)bmin[b+7];  hi=(int)bmax[b+7];  if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[8];  lo=(int)bmin[b+8];  hi=(int)bmax[b+8];  if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[9];  lo=(int)bmin[b+9];  hi=(int)bmax[b+9];  if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[10]; lo=(int)bmin[b+10]; hi=(int)bmax[b+10]; if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[11]; lo=(int)bmin[b+11]; hi=(int)bmax[b+11]; if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[12]; lo=(int)bmin[b+12]; hi=(int)bmax[b+12]; if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+        qi=(int)q[13]; lo=(int)bmin[b+13]; hi=(int)bmax[b+13]; if(qi<lo){diff=lo-qi;sum+=diff*diff;}else if(qi>hi){diff=qi-hi;sum+=diff*diff;}
+
+        return sum;
     }
 
     // ── Probe insertion (variable-K version for centroid top-nprobe) ──────────

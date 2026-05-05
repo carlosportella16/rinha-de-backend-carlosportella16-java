@@ -41,12 +41,12 @@ public final class Main {
      * Pre-encode all 6 responses — zero JSON building at query time.
      */
     private static final ByteBuf[] RESPONSES = {
-        staticBuf("{\"approved\":true,\"fraud_score\":0.0}"),
-        staticBuf("{\"approved\":true,\"fraud_score\":0.2}"),
-        staticBuf("{\"approved\":true,\"fraud_score\":0.4}"),
-        staticBuf("{\"approved\":false,\"fraud_score\":0.6}"),
-        staticBuf("{\"approved\":false,\"fraud_score\":0.8}"),
-        staticBuf("{\"approved\":false,\"fraud_score\":1.0}"),
+            staticBuf("{\"approved\":true,\"fraud_score\":0.0}"),
+            staticBuf("{\"approved\":true,\"fraud_score\":0.2}"),
+            staticBuf("{\"approved\":true,\"fraud_score\":0.4}"),
+            staticBuf("{\"approved\":false,\"fraud_score\":0.6}"),
+            staticBuf("{\"approved\":false,\"fraud_score\":0.8}"),
+            staticBuf("{\"approved\":false,\"fraud_score\":1.0}"),
     };
 
     private static ByteBuf staticBuf(String s) {
@@ -86,9 +86,9 @@ public final class Main {
                     @Override
                     protected void initChannel(SocketChannel ch) {
                         ch.pipeline()
-                          .addLast(new HttpServerCodec())
-                          .addLast(new HttpObjectAggregator(65536))
-                          .addLast(RequestHandler.INSTANCE);
+                                .addLast(new HttpServerCodec())
+                                .addLast(new HttpObjectAggregator(65536))
+                                .addLast(RequestHandler.INSTANCE);
                     }
                 })
                 .bind(PORT)
@@ -100,6 +100,13 @@ public final class Main {
             long t = System.currentTimeMillis();
             System.out.println("Loading vectors from: " + binPath);
             STORE = VectorLoader.loadOffHeap(binPath);
+            // Allow runtime override of nprobe via NPROBE env var (default: value baked into .bin header)
+            final String nprobeEnv = System.getenv("NPROBE");
+            if (nprobeEnv != null && !nprobeEnv.isEmpty()) {
+                final int overrideNprobe = Integer.parseInt(nprobeEnv.trim());
+                System.out.printf("NPROBE env override: %d → %d%n", STORE.defaultNprobe, overrideNprobe);
+                STORE.defaultNprobe = overrideNprobe;
+            }
             System.out.printf("Loaded %,d vectors (C=%d, nprobe=%d) in %d ms%n",
                     STORE.size(), STORE.numClusters, STORE.defaultNprobe,
                     System.currentTimeMillis() - t);
@@ -194,7 +201,7 @@ public final class Main {
          *   2. DefaultFullHttpResponse — per-response headers
          */
         private static void handleFraudScore(ChannelHandlerContext ctx,
-                                              FullHttpRequest req, boolean ka) {
+                                             FullHttpRequest req, boolean ka) {
             final float[] vec     = RequestParser.TL_VEC.get();
             final byte[]  vecInt8 = KnnSearch.TL_VEC_INT8.get();
             final float[] topDist = KnnSearch.TL_DIST.get();
@@ -209,18 +216,18 @@ public final class Main {
             KnnSearch.searchIVF(STORE, vec, vecInt8, topDist, topIdx, STORE.defaultNprobe);
 
             send(ctx, HttpResponseStatus.OK,
-                 RESPONSES[KnnSearch.fraudCount(STORE, topIdx)], ka);
+                    RESPONSES[KnnSearch.fraudCount(STORE, topIdx)], ka);
         }
 
         private static void send(ChannelHandlerContext ctx, HttpResponseStatus status,
-                                  ByteBuf body, boolean keepAlive) {
+                                 ByteBuf body, boolean keepAlive) {
             final ByteBuf slice = body.duplicate();
             final FullHttpResponse res = new DefaultFullHttpResponse(
                     HttpVersion.HTTP_1_1, status, slice, HEADERS_FACTORY, TRAILERS_FACTORY);
 
             res.headers()
-               .set(HttpHeaderNames.CONTENT_TYPE,     CONTENT_TYPE_JSON)
-               .setInt(HttpHeaderNames.CONTENT_LENGTH, slice.readableBytes());
+                    .set(HttpHeaderNames.CONTENT_TYPE,     CONTENT_TYPE_JSON)
+                    .setInt(HttpHeaderNames.CONTENT_LENGTH, slice.readableBytes());
 
             if (keepAlive) {
                 res.headers().set(CONNECTION, KEEP_ALIVE_VALUE);

@@ -39,7 +39,7 @@ public final class ReferenceConverter {
 
     static final int C             = 512;   // number of IVF clusters
     static final int MAX_ITER      = 15;    // k-means iterations
-    static final int DEFAULT_NPROBE = 32;   // default nprobe at query time
+    static final int DEFAULT_NPROBE = 1;    // default nprobe at query time (override via NPROBE env)
     static final int HEADER_BYTES  = 32;    // v4 header size (same as v3)
 
     public static void main(String[] args) throws Exception {
@@ -170,14 +170,14 @@ public final class ReferenceConverter {
 
             // Centroids (float32 LE)
             final ByteBuffer centBuf = ByteBuffer.allocateDirect(C * VectorStore.DIMS * Float.BYTES)
-                                                  .order(ByteOrder.LITTLE_ENDIAN);
+                    .order(ByteOrder.LITTLE_ENDIAN);
             for (float v : centroids) centBuf.putFloat(v);
             centBuf.flip();
             writeFully(out, centBuf);
 
             // Cluster sizes
             final ByteBuffer szBuf = ByteBuffer.allocateDirect(C * Integer.BYTES)
-                                               .order(ByteOrder.LITTLE_ENDIAN);
+                    .order(ByteOrder.LITTLE_ENDIAN);
             for (int s : listSizes) szBuf.putInt(s);
             szBuf.flip();
             writeFully(out, szBuf);
@@ -186,7 +186,7 @@ public final class ReferenceConverter {
         }
 
         final long totalBytes = HEADER_BYTES + (long)N*VectorStore.DIMS + N
-                              + (long)C*VectorStore.DIMS*4L + (long)C*4L;
+                + (long)C*VectorStore.DIMS*4L + (long)C*4L;
         System.out.printf("  Done in %,d ms  →  %.1f MB%n",
                 System.currentTimeMillis() - t0, totalBytes / 1_048_576.0);
     }
@@ -208,7 +208,7 @@ public final class ReferenceConverter {
     }
 
     private static void parallelAssign(final float[] allVecs, final int N,
-                                        final float[] centroids, final int[] assignments) {
+                                       final float[] centroids, final int[] assignments) {
         final int DIMS  = VectorStore.DIMS;
         final int C_LOC = C;
         IntStream.range(0, N).parallel().forEach(i -> {
@@ -224,7 +224,7 @@ public final class ReferenceConverter {
     }
 
     private static void updateCentroids(final float[] allVecs, final int N,
-                                         final float[] centroids, final int[] assignments) {
+                                        final float[] centroids, final int[] assignments) {
         final int DIMS = VectorStore.DIMS;
         final double[] sums   = new double[C * DIMS];
         final int[]    counts = new int[C];
@@ -260,9 +260,9 @@ public final class ReferenceConverter {
         final float d12 = a[ai+12] - b[bi+12];
         final float d13 = a[ai+13] - b[bi+13];
         return d0*d0 + d1*d1 + d2*d2  + d3*d3
-             + d4*d4 + d5*d5 + d6*d6  + d7*d7
-             + d8*d8 + d9*d9 + d10*d10 + d11*d11
-             + d12*d12 + d13*d13;
+                + d4*d4 + d5*d5 + d6*d6  + d7*d7
+                + d8*d8 + d9*d9 + d10*d10 + d11*d11
+                + d12*d12 + d13*d13;
     }
 
     // ── I/O helpers ──────────────────────────────────────────────────────────

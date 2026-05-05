@@ -59,6 +59,12 @@ final class OffHeapVectorStore {
     int     numClusters;
     int     defaultNprobe;
 
+    // ── Per-cluster bounding boxes (INT8 scale) ───────────────────────────────
+    // Flat arrays: index [c*DIMS + d] gives the min/max INT8 value of dimension d
+    // across all vectors assigned to cluster c.  Same signed-byte scale as distSqInt8.
+    byte[]  bboxMinInt8;   // C × DIMS — per-dim minimum
+    byte[]  bboxMaxInt8;   // C × DIMS — per-dim maximum
+
     // ── Construction ──────────────────────────────────────────────────────────
 
     OffHeapVectorStore() { this(CAPACITY); }
@@ -111,6 +117,59 @@ final class OffHeapVectorStore {
         d = (int)query[12] - (int)UNSAFE.getByte(base+12);  sum += d*d; if (sum >= threshold) return sum;
         d = (int)query[13] - (int)UNSAFE.getByte(base+13);  sum += d*d;
         return sum;
+    }
+
+    // ── Bounding-box construction ─────────────────────────────────────────────
+
+    /**
+     * Scans every cluster and records the per-dimension INT8 min/max.
+     * Called once after the IVF index is fully loaded.
+     * V4: vectors are cluster-ordered (no listData).
+     * V3: vector positions are looked up via listData.
+     */
+    void buildBboxes() {
+        final int C = numClusters;
+        bboxMinInt8 = new byte[C * DIMS];
+        bboxMaxInt8 = new byte[C * DIMS];
+
+        // Initialise: min = +127, max = -127 (full INT8 range)
+        for (int i = 0, n = C * DIMS; i < n; i++) {
+            bboxMinInt8[i] = (byte)  127;
+            bboxMaxInt8[i] = (byte) -127;
+        }
+
+        if (listData == null) {
+            // V4 — cluster-ordered: offset is the physical start index
+            for (int c = 0; c < C; c++) {
+                final int off   = listOffsets[c];
+                final int sz    = listSizes[c];
+                final int bbase = c * DIMS;
+                for (int li = 0; li < sz; li++) {
+                    final long vbase = vectorsAddr + (long)(off + li) * VEC_STRIDE;
+                    for (int d = 0; d < DIMS; d++) {
+                        final byte v = UNSAFE.getByte(vbase + d);
+                        if (v < bboxMinInt8[bbase + d]) bboxMinInt8[bbase + d] = v;
+                        if (v > bboxMaxInt8[bbase + d]) bboxMaxInt8[bbase + d] = v;
+                    }
+                }
+            }
+        } else {
+            // V3 — indirect via listData
+            for (int c = 0; c < C; c++) {
+                final int off   = listOffsets[c];
+                final int sz    = listSizes[c];
+                final int bbase = c * DIMS;
+                for (int li = 0; li < sz; li++) {
+                    final int  idx   = listData[off + li];
+                    final long vbase = vectorsAddr + (long)idx * VEC_STRIDE;
+                    for (int d = 0; d < DIMS; d++) {
+                        final byte v = UNSAFE.getByte(vbase + d);
+                        if (v < bboxMinInt8[bbase + d]) bboxMinInt8[bbase + d] = v;
+                        if (v > bboxMaxInt8[bbase + d]) bboxMaxInt8[bbase + d] = v;
+                    }
+                }
+            }
+        }
     }
 
     // ── Write (testing / loading via add()) ───────────────────────────────────
