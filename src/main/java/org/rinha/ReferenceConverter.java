@@ -119,16 +119,16 @@ public final class ReferenceConverter {
         for (int c = 0; c < C; c++) { minSz = Math.min(minSz, listSizes[c]); maxSz = Math.max(maxSz, listSizes[c]); }
         System.out.printf("  Cluster sizes: min=%d, avg=%d, max=%d%n", minSz, N/C, maxSz);
 
-        // ── Step 4: Write version 4 binary (cluster-ordered, no listData) ─────
-        System.out.println("  Writing binary (V4 cluster-ordered)...");
+        // ── Step 4: Write version 5 binary (SoA-within-blocks-of-8) ─────────
+        System.out.println("  Writing binary (V5 SoA-within-blocks)...");
         try (FileChannel out = FileChannel.open(
                 Paths.get(outPath),
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
 
-            // Header
+            // Header (same layout as V4, version field bumped to 5)
             final ByteBuffer hdr = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
             hdr.putInt(VectorLoader.MAGIC);
-            hdr.putInt(VectorLoader.VERSION_4);
+            hdr.putInt(VectorLoader.VERSION_5);
             hdr.putInt(N);
             hdr.putInt(VectorStore.DIMS);
             hdr.putInt(C);
@@ -138,27 +138,41 @@ public final class ReferenceConverter {
             hdr.flip();
             writeFully(out, hdr);
 
-            // INT8 vectors in cluster order
-            final int BATCH = 65_536;
-            final ByteBuffer vecBuf = ByteBuffer.allocateDirect(BATCH * VectorStore.DIMS);
-            for (int start = 0; start < N; start += BATCH) {
-                final int end = Math.min(start + BATCH, N);
+            // INT8 vectors in SoA-within-blocks-of-8 cluster order.
+            // For each cluster: floor(sz/8) full SoA blocks followed by (sz%8) AoS vecs.
+            // Total bytes = N × DIMS (same as V4 — only ordering within clusters changes).
+            final ByteBuffer vecBuf = ByteBuffer.allocateDirect((maxSz + 8) * VectorStore.DIMS);
+            for (int c = 0; c < C; c++) {
+                final int off    = listOffsets[c];
+                final int sz     = listSizes[c];
+                final int blocks = sz >> 3;
+                final int rem    = sz & 7;
                 vecBuf.clear();
-                for (int ni = start; ni < end; ni++) {
-                    final int vi = permutation[ni] * VectorStore.DIMS;
+
+                // Full SoA blocks: DIMS × 8 bytes per block.
+                // Within each block, all values for dim d come before all values for dim d+1.
+                for (int b = 0; b < blocks; b++) {
                     for (int d = 0; d < VectorStore.DIMS; d++) {
-                        final float f = allVecs[vi + d];
-                        int q = (int)(f * 127f + (f >= 0f ? 0.5f : -0.5f));
-                        if (q < -127) q = -127;
-                        else if (q > 127) q = 127;
-                        vecBuf.put((byte) q);
+                        for (int lane = 0; lane < 8; lane++) {
+                            vecBuf.put(quantize(allVecs[permutation[off + b * 8 + lane] * VectorStore.DIMS + d]));
+                        }
                     }
                 }
+
+                // AoS remainder: last (sz % 8) vectors stored in row-major order
+                for (int i = blocks * 8; i < sz; i++) {
+                    final int origIdx = permutation[off + i];
+                    for (int d = 0; d < VectorStore.DIMS; d++) {
+                        vecBuf.put(quantize(allVecs[origIdx * VectorStore.DIMS + d]));
+                    }
+                }
+
                 vecBuf.flip();
                 writeFully(out, vecBuf);
             }
 
-            // Labels in cluster order
+            // Labels in cluster order (unchanged from V4)
+            final int BATCH = 65_536;
             final ByteBuffer lblBuf = ByteBuffer.allocateDirect(Math.min(N, BATCH));
             for (int start = 0; start < N; start += BATCH) {
                 final int end = Math.min(start + BATCH, N);
@@ -181,14 +195,21 @@ public final class ReferenceConverter {
             for (int s : listSizes) szBuf.putInt(s);
             szBuf.flip();
             writeFully(out, szBuf);
-
-            // No listData in V4 — sequential access replaces it
         }
 
         final long totalBytes = HEADER_BYTES + (long)N*VectorStore.DIMS + N
                 + (long)C*VectorStore.DIMS*4L + (long)C*4L;
         System.out.printf("  Done in %,d ms  →  %.1f MB%n",
                 System.currentTimeMillis() - t0, totalBytes / 1_048_576.0);
+    }
+
+    // ── Quantization helper ───────────────────────────────────────────────────
+
+    private static byte quantize(float f) {
+        int q = (int)(f * 127f + (f >= 0f ? 0.5f : -0.5f));
+        if (q < -127) q = -127;
+        else if (q > 127) q = 127;
+        return (byte) q;
     }
 
     // ── K-means helpers ───────────────────────────────────────────────────────

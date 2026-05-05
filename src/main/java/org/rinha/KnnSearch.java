@@ -88,6 +88,8 @@ final class KnnSearch {
         // field accesses through 'store' inside the inner distance loop.
         final byte[]  vecs       = store.vectors;
 
+        final boolean soa = store.soaLayout;
+
         // ── Phase 1 — nprobe=1 fast path ─────────────────────────────────────
         // When only one cluster is requested, we just need the best centroid.
         // No sorted list, no scratch arrays.
@@ -103,14 +105,18 @@ final class KnnSearch {
             // (worstInt = MAX_VALUE), so the lower-bound check can never prune.
             final int off = listOffsets[bestC];
             final int sz  = listSizes[bestC];
-            int worstInt  = Integer.MAX_VALUE;
 
-            for (int li = 0, vb = off * OffHeapVectorStore.DIMS; li < sz; li++, vb += OffHeapVectorStore.DIMS) {
-                final int d = distSqInt8(queryInt8, vecs, vb, worstInt);
-                if (d < worstInt) {
-                    insert(topDist, topIdx, (float) d, off + li);
-                    final float w = topDist[K - 1];
-                    worstInt = (w == Float.MAX_VALUE) ? Integer.MAX_VALUE : (int) w;
+            if (soa) {
+                scanClusterSoA(queryInt8, vecs, off, sz, topDist, topIdx, Integer.MAX_VALUE);
+            } else {
+                int worstInt = Integer.MAX_VALUE;
+                for (int li = 0, vb = off * OffHeapVectorStore.DIMS; li < sz; li++, vb += OffHeapVectorStore.DIMS) {
+                    final int d = distSqInt8(queryInt8, vecs, vb, worstInt);
+                    if (d < worstInt) {
+                        insert(topDist, topIdx, (float) d, off + li);
+                        final float w = topDist[K - 1];
+                        worstInt = (w == Float.MAX_VALUE) ? Integer.MAX_VALUE : (int) w;
+                    }
                 }
             }
             return;
@@ -150,15 +156,80 @@ final class KnnSearch {
             final int off = listOffsets[c];
             final int sz  = listSizes[c];
 
-            for (int li = 0, vb = off * OffHeapVectorStore.DIMS; li < sz; li++, vb += OffHeapVectorStore.DIMS) {
-                final int d = distSqInt8(queryInt8, vecs, vb, worstInt);
-                if (d < worstInt) {
-                    insert(topDist, topIdx, (float) d, off + li);
+            if (soa) {
+                worstInt = scanClusterSoA(queryInt8, vecs, off, sz, topDist, topIdx, worstInt);
+            } else {
+                for (int li = 0, vb = off * OffHeapVectorStore.DIMS; li < sz; li++, vb += OffHeapVectorStore.DIMS) {
+                    final int d = distSqInt8(queryInt8, vecs, vb, worstInt);
+                    if (d < worstInt) {
+                        insert(topDist, topIdx, (float) d, off + li);
+                        final float w = topDist[K - 1];
+                        worstInt = (w == Float.MAX_VALUE) ? Integer.MAX_VALUE : (int) w;
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Scans one cluster using SoA-within-blocks-of-8 memory layout, computing
+     * distances to 8 candidates simultaneously via SIMD.
+     *
+     * Memory layout for a block of 8 vectors:
+     *   [8 × dim0 values][8 × dim1 values]...[8 × dim13 values]
+     * This lets us load 8 db values for one dimension in a single BYTE_SPEC_64
+     * load, broadcast the query value, subtract and square — all in one burst.
+     * The last (clusterSize % 8) vectors fall back to scalar AoS.
+     */
+    private static int scanClusterSoA(final byte[] q, final byte[] vecs,
+                                      final int off, final int sz,
+                                      final float[] topDist, final int[] topIdx,
+                                      int worstInt) {
+        final int DIMS        = OffHeapVectorStore.DIMS;
+        final int clusterBase = off * DIMS;
+        final int blocks      = sz >> 3;   // sz / 8
+        final int rem         = sz  & 7;   // sz % 8
+
+        for (int b = 0; b < blocks; b++) {
+            final int blockBase = clusterBase + b * DIMS * 8;
+
+            // Accumulate squared distances for 8 candidates at once across all 14 dims.
+            // Byte values are widened to short before subtraction (avoids byte overflow),
+            // then to int before squaring (short squared can exceed short max).
+            IntVector acc = IntVector.zero(INT_SPEC);
+            for (int d = 0; d < DIMS; d++) {
+                final ByteVector  dbV  = ByteVector.fromArray(BYTE_SPEC, vecs, blockBase + d * 8);
+                final ShortVector dbS  = (ShortVector) dbV.convertShape(VectorOperators.B2S, SHORT_SPEC, 0);
+                final ShortVector qS   = ShortVector.broadcast(SHORT_SPEC, (short) q[d]);
+                final IntVector   diffI = (IntVector) qS.sub(dbS).convertShape(VectorOperators.S2I, INT_SPEC, 0);
+                acc = acc.add(diffI.mul(diffI));
+            }
+
+            // Update the top-K heap with each of the 8 distances
+            final int vecBase = off + (b << 3);
+            for (int lane = 0; lane < 8; lane++) {
+                final int dist = acc.lane(lane);
+                if (dist < worstInt) {
+                    insert(topDist, topIdx, (float) dist, vecBase + lane);
                     final float w = topDist[K - 1];
                     worstInt = (w == Float.MAX_VALUE) ? Integer.MAX_VALUE : (int) w;
                 }
             }
         }
+
+        // Scalar AoS fallback for the last (sz % 8) vectors
+        final int remBase  = clusterBase + blocks * DIMS * 8;
+        final int remStart = off + (blocks << 3);
+        for (int i = 0; i < rem; i++) {
+            final int dist = distSqInt8(q, vecs, remBase + i * DIMS, worstInt);
+            if (dist < worstInt) {
+                insert(topDist, topIdx, (float) dist, remStart + i);
+                final float w = topDist[K - 1];
+                worstInt = (w == Float.MAX_VALUE) ? Integer.MAX_VALUE : (int) w;
+            }
+        }
+
+        return worstInt;
     }
 
     // ── Centroid distance (no early termination — kept for reference) ─────────

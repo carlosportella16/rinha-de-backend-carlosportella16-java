@@ -16,11 +16,21 @@ import java.nio.file.*;
  *   Version 3 (INT8 + IVF, original order):
  *     Header 32 bytes | INT8 Vectors N×14 | Labels N | Centroids C×56 | Sizes C×4 | Data N×4
  *
- *   Version 4 (INT8 + IVF, cluster-ordered — production):
- *     Header 32 bytes | INT8 Vectors N×14 (cluster order) | Labels N (cluster order)
+ *   Version 4 (INT8 + IVF, cluster-ordered — AoS):
+ *     Header 32 bytes | INT8 Vectors N×14 (cluster order, row-major) | Labels N
  *                     | Centroids C×56 | Sizes C×4
  *
- * After loading, both V3 and V4 produce the same in-memory layout:
+ *   Version 5 (INT8 + IVF, cluster-ordered — SoA blocks of 8):
+ *     Same header as V4. Vectors laid out in column-major blocks of 8 within
+ *     each cluster: for each block of 8 consecutive vectors, DIMS groups of 8
+ *     bytes are stored (all dim-0 values first, then dim-1, ..., dim-13).
+ *     Any remainder (clusterSize % 8 vectors) is appended in AoS order.
+ *     Total bytes = N × DIMS (identical to V4 — only the ordering changes).
+ *     This layout lets Phase 2 compute distances to 8 candidates simultaneously
+ *     via SIMD rather than 8 dimensions of one candidate.
+ *
+ * After loading, V3/V4/V5 produce the same field structure in OffHeapVectorStore;
+ * store.soaLayout distinguishes V5 from V3/V4 for Phase 2 dispatch:
  *   store.vectors[]     — flat byte[], N × DIMS, cluster-ordered
  *   store.labels[]      — flat byte[], N, cluster-ordered
  *   store.listData      — always null (indirection eliminated at load time for V3)
@@ -41,7 +51,8 @@ final class VectorLoader {
     static final int MAGIC     = 0x52494E48;
     static final int VERSION_2 = 2;
     static final int VERSION_3 = 3;
-    static final int VERSION_4 = 4;  // cluster-ordered: sequential scan, no listData
+    static final int VERSION_4 = 4;  // cluster-ordered AoS
+    static final int VERSION_5 = 5;  // cluster-ordered SoA-within-blocks (8 candidates/SIMD op)
 
     private static final int HEADER_V2 = 16;
     private static final int HEADER_V3 = 32;   // also used for V4
@@ -67,8 +78,8 @@ final class VectorLoader {
             if (dims  != OffHeapVectorStore.DIMS) throw new IOException("bad dims: " + dims);
             if (count <= 0)                       throw new IOException("bad count: " + count);
 
-            if (version == VERSION_4 || version == VERSION_3) {
-                // Read the additional 16 bytes unique to V3/V4 header
+            if (version == VERSION_5 || version == VERSION_4 || version == VERSION_3) {
+                // Read the additional 16 bytes unique to V3/V4/V5 header
                 final ByteBuffer hdr3 = ByteBuffer.allocate(HEADER_V3 - HEADER_V2)
                         .order(ByteOrder.LITTLE_ENDIAN);
                 readFully(fc, hdr3);
@@ -76,6 +87,7 @@ final class VectorLoader {
                 final int clusters = hdr3.getInt();
                 final int nprobe   = hdr3.getInt();
                 // skip reserved 8 bytes (already read into hdr3)
+                if (version == VERSION_5) return loadV5(fc, count, clusters, nprobe);
                 if (version == VERSION_4) return loadV4(fc, count, clusters, nprobe);
                 return loadV3(fc, count, clusters, nprobe);
             } else if (version == VERSION_2) {
@@ -117,6 +129,38 @@ final class VectorLoader {
         store.listOffsets   = listOffsets;
         store.listSizes     = listSizes;
         store.listData      = null;      // cluster-ordered, no indirection needed
+        store.numClusters   = C;
+        store.defaultNprobe = nprobe;
+
+        store.buildBboxes();
+
+        return store;
+    }
+
+    // ── Version 5 loader (SoA-within-blocks, identical wire format to V4) ──────
+    // Same on-disk structure as V4 (header + vectors + labels + centroids + sizes)
+    // but vectors are in SoA column-major-blocks-of-8 order within each cluster.
+    // We read them straight into store.vectors[] without reordering — the layout
+    // is correct as-is. The only difference from loadV4 is setting soaLayout=true.
+
+    private static OffHeapVectorStore loadV5(FileChannel fc, int N, int C, int nprobe)
+            throws IOException {
+
+        final OffHeapVectorStore store = new OffHeapVectorStore(N);
+        store.soaLayout = true;
+
+        readFully(fc, ByteBuffer.wrap(store.vectors, 0, N * OffHeapVectorStore.VEC_STRIDE));
+        readFully(fc, ByteBuffer.wrap(store.labels,  0, N));
+
+        final float[] centroids  = readCentroids(fc, C);
+        final int[]   listSizes  = readSizes(fc, C);
+        final int[]   listOffsets = buildOffsets(listSizes, C);
+
+        store.forceSize(N);
+        store.centroids     = centroids;
+        store.listOffsets   = listOffsets;
+        store.listSizes     = listSizes;
+        store.listData      = null;
         store.numClusters   = C;
         store.defaultNprobe = nprobe;
 

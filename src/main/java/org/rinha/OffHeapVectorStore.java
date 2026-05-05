@@ -40,6 +40,10 @@ final class OffHeapVectorStore {
     int     numClusters;
     int     defaultNprobe;
 
+    // When true, vectors[] uses SoA-within-blocks-of-8 layout (V5 binary format).
+    // KnnSearch.searchIVF branches on this to pick the SIMD Phase 2 path.
+    boolean soaLayout;
+
     // ── Per-cluster bounding boxes (INT8 scale, flat arrays) ─────────────────
     // bboxMinInt8[c*DIMS + d] = minimum INT8 value of dimension d in cluster c.
     byte[] bboxMinInt8;   // C × DIMS
@@ -114,12 +118,37 @@ final class OffHeapVectorStore {
             final int off   = listOffsets[c];
             final int sz    = listSizes[c];
             final int bbase = c * DIMS;
-            for (int li = 0; li < sz; li++) {
-                final int vbase = (off + li) * DIMS;
-                for (int d = 0; d < DIMS; d++) {
-                    final byte v = vectors[vbase + d];
-                    if (v < bboxMinInt8[bbase + d]) bboxMinInt8[bbase + d] = v;
-                    if (v > bboxMaxInt8[bbase + d]) bboxMaxInt8[bbase + d] = v;
+            if (soaLayout) {
+                final int clusterBase = off * DIMS;
+                final int blocks      = sz >> 3;
+                final int rem         = sz &  7;
+                for (int b = 0; b < blocks; b++) {
+                    for (int d = 0; d < DIMS; d++) {
+                        final int pos = clusterBase + b * DIMS * 8 + d * 8;
+                        for (int lane = 0; lane < 8; lane++) {
+                            final byte v = vectors[pos + lane];
+                            if (v < bboxMinInt8[bbase + d]) bboxMinInt8[bbase + d] = v;
+                            if (v > bboxMaxInt8[bbase + d]) bboxMaxInt8[bbase + d] = v;
+                        }
+                    }
+                }
+                final int remBase = clusterBase + blocks * DIMS * 8;
+                for (int i = 0; i < rem; i++) {
+                    final int vbase = remBase + i * DIMS;
+                    for (int d = 0; d < DIMS; d++) {
+                        final byte v = vectors[vbase + d];
+                        if (v < bboxMinInt8[bbase + d]) bboxMinInt8[bbase + d] = v;
+                        if (v > bboxMaxInt8[bbase + d]) bboxMaxInt8[bbase + d] = v;
+                    }
+                }
+            } else {
+                for (int li = 0; li < sz; li++) {
+                    final int vbase = (off + li) * DIMS;
+                    for (int d = 0; d < DIMS; d++) {
+                        final byte v = vectors[vbase + d];
+                        if (v < bboxMinInt8[bbase + d]) bboxMinInt8[bbase + d] = v;
+                        if (v > bboxMaxInt8[bbase + d]) bboxMaxInt8[bbase + d] = v;
+                    }
                 }
             }
         }
