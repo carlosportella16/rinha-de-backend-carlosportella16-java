@@ -166,7 +166,8 @@ final class RequestParser {
         // ── assemble 14-dim vector ────────────────────────────────────────────
         v[0]  = clamp(txAmount / MAX_AMOUNT);
         v[1]  = clamp(installments / MAX_INSTALL);
-        v[2]  = clamp((txAmount / custAvg) / AMT_AVG_RATIO);
+        // Guard against custAvg=0: 0/0=NaN would produce wrong vector; use 0.0 instead
+        v[2]  = (custAvg == 0f) ? 0f : clamp((txAmount / custAvg) / AMT_AVG_RATIO);
         v[3]  = isoHour(b, reqAtPos) / 23f;
         v[4]  = isoDOW (b, reqAtPos) / 6f;
         v[5]  = hasLast ? clamp(minutesSinceLast / MAX_MINUTES) : -1f;

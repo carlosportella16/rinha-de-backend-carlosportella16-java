@@ -217,14 +217,37 @@ public final class ReferenceConverter {
     private static float[] initCentroids(float[] allVecs, int N) {
         final float[] centroids = new float[C * VectorStore.DIMS];
         final Random rng = new Random(0x42424242L); // fixed seed for reproducibility
-        // Pick C distinct random vectors as initial centroids
-        final boolean[] used = new boolean[N];
-        for (int c = 0; c < C; c++) {
-            int idx;
-            do { idx = rng.nextInt(N); } while (used[idx]);
-            used[idx] = true;
-            System.arraycopy(allVecs, idx * VectorStore.DIMS, centroids, c * VectorStore.DIMS, VectorStore.DIMS);
+        final int DIMS = VectorStore.DIMS;
+
+        // k-means++ initialization: better spread → faster convergence + higher recall
+        // Step 1: pick first centroid uniformly at random
+        int first = rng.nextInt(N);
+        System.arraycopy(allVecs, first * DIMS, centroids, 0, DIMS);
+
+        // Step 2: for each subsequent centroid, sample with probability proportional to d²
+        final float[] minDist = new float[N];
+        Arrays.fill(minDist, Float.MAX_VALUE);
+
+        for (int c = 1; c < C; c++) {
+            // Update minimum squared distances to any already-chosen centroid
+            final int prevBase = (c - 1) * DIMS;
+            double totalDist = 0.0;
+            for (int i = 0; i < N; i++) {
+                final float d = vecDistSq14(allVecs, i * DIMS, centroids, prevBase);
+                if (d < minDist[i]) minDist[i] = d;
+                totalDist += minDist[i];
+            }
+            // Sample next centroid with probability proportional to minDist[i]
+            double target = rng.nextDouble() * totalDist;
+            int chosen = 0;
+            for (int i = 0; i < N; i++) {
+                target -= minDist[i];
+                if (target <= 0.0) { chosen = i; break; }
+            }
+            System.arraycopy(allVecs, chosen * DIMS, centroids, c * DIMS, DIMS);
+            if (c % 100 == 0) System.out.printf("  k-means++ init: %d/%d\r", c, C);
         }
+        System.out.println();
         return centroids;
     }
 

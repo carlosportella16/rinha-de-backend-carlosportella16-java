@@ -15,7 +15,6 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.unix.DomainSocketAddress;
 import io.netty.handler.codec.http.*;
-import io.netty.util.AsciiString;
 import io.netty.util.CharsetUtil;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -25,38 +24,51 @@ public final class Main {
     private static final int PORT = Integer.parseInt(
             System.getenv().getOrDefault("SERVER_PORT", "9999"));
 
-    private static final AsciiString CONTENT_TYPE_JSON = AsciiString.cached("application/json");
-    private static final AsciiString CONNECTION        = AsciiString.cached("connection");
-    private static final AsciiString KEEP_ALIVE_VALUE  = AsciiString.cached("keep-alive");
-
-    private static final HttpHeadersFactory HEADERS_FACTORY  =
-            DefaultHttpHeadersFactory.headersFactory().withValidation(false);
-    private static final HttpHeadersFactory TRAILERS_FACTORY =
-            DefaultHttpHeadersFactory.trailersFactory().withValidation(false);
-
-    private static final ByteBuf BUF_OK          = staticBuf("OK");
-    private static final ByteBuf BUF_NOT_FOUND   = staticBuf("Not Found");
-    private static final ByteBuf BUF_METHOD_ERR  = staticBuf("Method Not Allowed");
-    private static final ByteBuf BUF_BAD_REQUEST = staticBuf("Bad Request");
-    private static final ByteBuf BUF_STARTING    = staticBuf("Starting");
-
     /*
-     * fraud_score is always n/5 for n ∈ {0,1,2,3,4,5}.
-     * Pre-encode all 6 responses — zero JSON building at query time.
+     * Pre-build complete HTTP/1.1 200 OK responses (headers + body) for each of the
+     * 6 possible fraud scores. Responses are written as raw ByteBuf — no
+     * DefaultFullHttpResponse allocation per request. Zero GC pressure on hot path.
+     * fraud_score = n/5 for n ∈ {0,1,2,3,4,5}
      */
-    private static final ByteBuf[] RESPONSES = {
-            staticBuf("{\"approved\":true,\"fraud_score\":0.0}"),
-            staticBuf("{\"approved\":true,\"fraud_score\":0.2}"),
-            staticBuf("{\"approved\":true,\"fraud_score\":0.4}"),
-            staticBuf("{\"approved\":false,\"fraud_score\":0.6}"),
-            staticBuf("{\"approved\":false,\"fraud_score\":0.8}"),
-            staticBuf("{\"approved\":false,\"fraud_score\":1.0}"),
-    };
+    private static final ByteBuf[] HTTP_OK_RESPONSES = buildHttpResponses();
 
-    private static ByteBuf staticBuf(String s) {
-        byte[] b = s.getBytes(CharsetUtil.UTF_8);
+    private static ByteBuf[] buildHttpResponses() {
+        final String[] bodies = {
+            "{\"approved\":true,\"fraud_score\":0.0}",
+            "{\"approved\":true,\"fraud_score\":0.2}",
+            "{\"approved\":true,\"fraud_score\":0.4}",
+            "{\"approved\":false,\"fraud_score\":0.6}",
+            "{\"approved\":false,\"fraud_score\":0.8}",
+            "{\"approved\":false,\"fraud_score\":1.0}",
+        };
+        final ByteBuf[] r = new ByteBuf[bodies.length];
+        for (int i = 0; i < bodies.length; i++) {
+            r[i] = rawHttpResponse(200, "OK", "application/json", bodies[i]);
+        }
+        return r;
+    }
+
+    private static final ByteBuf HTTP_BAD_REQUEST         = rawHttpResponse(400, "Bad Request",
+            "text/plain", "Bad Request");
+    private static final ByteBuf HTTP_NOT_FOUND           = rawHttpResponse(404, "Not Found",
+            "text/plain", "Not Found");
+    private static final ByteBuf HTTP_METHOD_NOT_ALLOWED  = rawHttpResponse(405, "Method Not Allowed",
+            "text/plain", "Method Not Allowed");
+    private static final ByteBuf HTTP_SERVICE_UNAVAILABLE = rawHttpResponse(503, "Service Unavailable",
+            "text/plain", "Starting");
+    private static final ByteBuf HTTP_READY_OK            = rawHttpResponse(200, "OK",
+            "text/plain", "OK");
+
+    private static ByteBuf rawHttpResponse(int status, String statusText,
+                                            String contentType, String body) {
+        final String http = "HTTP/1.1 " + status + " " + statusText + "\r\n"
+                + "Content-Type: " + contentType + "\r\n"
+                + "Content-Length: " + body.length() + "\r\n"
+                + "Connection: keep-alive\r\n\r\n"
+                + body;
+        final byte[] bytes = http.getBytes(CharsetUtil.US_ASCII);
         return Unpooled.unreleasableBuffer(
-                Unpooled.directBuffer(b.length).writeBytes(b));
+                Unpooled.directBuffer(bytes.length).writeBytes(bytes));
     }
 
     static OffHeapVectorStore STORE;
@@ -76,26 +88,30 @@ public final class Main {
                 : NioServerSocketChannel.class;
         System.out.println("Transport: " + (useEpoll ? "epoll" : "nio"));
 
-        // 1 boss + 2 workers per 0.5-CPU instance (contest: 1 CPU / 2 instances)
+        // 1 boss + 1 worker per instance.
+        // With 0.475 CPU and CFS throttling, a single event-loop worker is more
+        // efficient: no context-switch overhead between 2 workers fighting for the same
+        // CPU quota. Netty is event-driven — 1 thread handles all I/O without blocking.
         final MultiThreadIoEventLoopGroup boss   = new MultiThreadIoEventLoopGroup(1, ioFactory);
-        final MultiThreadIoEventLoopGroup worker = new MultiThreadIoEventLoopGroup(2, ioFactory);
+        final MultiThreadIoEventLoopGroup worker = new MultiThreadIoEventLoopGroup(1, ioFactory);
 
-        // TCP listener — always active; used by health checks (wget localhost:PORT/ready)
+        // TCP listener — always active; used by health checks (test -f /tmp/ready)
         final Channel channel = new ServerBootstrap()
                 .group(boss, worker)
                 .channel(channelClass)
-                .option(ChannelOption.SO_BACKLOG, 1024)
+                .option(ChannelOption.SO_BACKLOG, 2048)
                 .option(ChannelOption.SO_REUSEADDR, true)
                 .childOption(ChannelOption.TCP_NODELAY, true)
                 .childOption(ChannelOption.SO_KEEPALIVE, false)
-                .childOption(ChannelOption.SO_RCVBUF, 16384)
-                .childOption(ChannelOption.SO_SNDBUF, 16384)
+                .childOption(ChannelOption.SO_RCVBUF, 32768)
+                .childOption(ChannelOption.SO_SNDBUF, 32768)
                 .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                 .childHandler(new ChannelInitializer<SocketChannel>() {
                     @Override
                     protected void initChannel(SocketChannel ch) {
                         ch.pipeline()
-                                .addLast(new HttpServerCodec())
+                                // Decode only — responses are raw ByteBuf, no encoder needed
+                                .addLast(new HttpRequestDecoder(4096, 8192, 8192))
                                 // 8 KB max body size — real payloads are ~500 bytes
                                 .addLast(new HttpObjectAggregator(8192))
                                 .addLast(RequestHandler.INSTANCE);
@@ -114,13 +130,13 @@ public final class Main {
             new ServerBootstrap()
                     .group(boss, worker)
                     .channel(EpollServerDomainSocketChannel.class)
-                    .option(ChannelOption.SO_BACKLOG, 1024)
+                    .option(ChannelOption.SO_BACKLOG, 2048)
                     .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                     .childHandler(new ChannelInitializer<Channel>() {
                         @Override
                         protected void initChannel(Channel ch) {
                             ch.pipeline()
-                                    .addLast(new HttpServerCodec())
+                                    .addLast(new HttpRequestDecoder(4096, 8192, 8192))
                                     .addLast(new HttpObjectAggregator(8192))
                                     .addLast(RequestHandler.INSTANCE);
                         }
@@ -135,7 +151,7 @@ public final class Main {
             long t = System.currentTimeMillis();
             System.out.println("Loading vectors from: " + binPath);
             STORE = VectorLoader.loadOffHeap(binPath);
-            // Allow runtime override of nprobe via NPROBE env var (default: value baked into .bin header)
+            // Allow runtime override of nprobe via NPROBE env var
             final String nprobeEnv = System.getenv("NPROBE");
             if (nprobeEnv != null && !nprobeEnv.isEmpty()) {
                 final int overrideNprobe = Integer.parseInt(nprobeEnv.trim());
@@ -146,10 +162,12 @@ public final class Main {
                     STORE.size(), STORE.numClusters, STORE.defaultNprobe,
                     System.currentTimeMillis() - t);
 
-            // ── JIT warmup: 10k queries to reach C2 compilation ───────────────
-            // HotSpot C2 threshold is ~10k invocations; 1k wasn't enough.
+            // ── JIT warmup: 20k queries (2 × 10k) to reach stable C2 compilation ──
+            // HotSpot C2 threshold ≈ 10k invocations. Two passes ensure the SIMD path
+            // (scanClusterSoA) and all branch paths are fully compiled before traffic.
             t = System.currentTimeMillis();
-            System.out.println("Running JIT warmup (10 000 queries)…");
+            System.out.println("Running JIT warmup (20 000 queries)…");
+            warmup(STORE);
             warmup(STORE);
             warmupParser();
             System.out.printf("Warmup done in %d ms%n", System.currentTimeMillis() - t);
@@ -167,7 +185,7 @@ public final class Main {
 
     /**
      * Runs 10,000 synthetic searches before opening for traffic.
-     * This lets the JIT compile the hot path (distSqInt8, searchIVF, etc.)
+     * Lets the JIT compile the hot path (distSqInt8, searchIVF, scanClusterSoA)
      * to native code — including SIMD — before the first real request arrives.
      * Uses XorShift64 for random vectors: no allocation, no I/O, deterministic.
      */
@@ -195,11 +213,10 @@ public final class Main {
 
     /**
      * Warms up RequestParser so it is JIT-compiled before traffic arrives.
-     * Uses a minimal but complete JSON body that covers both branches
+     * Uses a minimal but complete JSON body covering both branches
      * (with and without last_transaction).
      */
     private static void warmupParser() {
-        // A minimal fraud-score body with last_transaction present
         final String body =
             "{\"transaction\":{\"amount\":100.0,\"installments\":1,"
             + "\"requested_at\":\"2025-01-15T14:30:00Z\"},"
@@ -229,9 +246,8 @@ public final class Main {
 
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest req) {
-            final boolean ka = HttpUtil.isKeepAlive(req);
             if (!READY) {
-                send(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, BUF_STARTING, ka);
+                ctx.writeAndFlush(HTTP_SERVICE_UNAVAILABLE.duplicate(), ctx.voidPromise());
                 return;
             }
 
@@ -240,66 +256,46 @@ public final class Main {
 
             if ("/fraud-score".equals(uri)) {
                 if (HttpMethod.POST.equals(m)) {
-                    handleFraudScore(ctx, req, ka);
+                    handleFraudScore(ctx, req);
                 } else {
-                    send(ctx, HttpResponseStatus.METHOD_NOT_ALLOWED, BUF_METHOD_ERR, ka);
+                    ctx.writeAndFlush(HTTP_METHOD_NOT_ALLOWED.duplicate(), ctx.voidPromise());
                 }
                 return;
             }
 
             if ("/ready".equals(uri)) {
                 if (HttpMethod.GET.equals(m)) {
-                    send(ctx, HttpResponseStatus.OK, BUF_OK, ka);
+                    ctx.writeAndFlush(HTTP_READY_OK.duplicate(), ctx.voidPromise());
                 } else {
-                    send(ctx, HttpResponseStatus.METHOD_NOT_ALLOWED, BUF_METHOD_ERR, ka);
+                    ctx.writeAndFlush(HTTP_METHOD_NOT_ALLOWED.duplicate(), ctx.voidPromise());
                 }
                 return;
             }
 
-            send(ctx, HttpResponseStatus.NOT_FOUND, BUF_NOT_FOUND, ka);
+            ctx.writeAndFlush(HTTP_NOT_FOUND.duplicate(), ctx.voidPromise());
         }
 
         /**
-         * POST /fraud-score handler.
-         * After JIT warmup this allocates nothing per request — all scratch
-         * buffers are ThreadLocal. The only two allocations that can't be
-         * avoided are the Netty response wrapper objects required by HTTP/1.1.
+         * POST /fraud-score handler — ZERO heap allocations per request.
+         * All scratch buffers are ThreadLocal; response is a pre-built static ByteBuf.
          */
-        private static void handleFraudScore(ChannelHandlerContext ctx,
-                                             FullHttpRequest req, boolean ka) {
+        private static void handleFraudScore(ChannelHandlerContext ctx, FullHttpRequest req) {
             final float[] vec     = RequestParser.TL_VEC.get();
             final byte[]  vecInt8 = KnnSearch.TL_VEC_INT8.get();
             final float[] topDist = KnnSearch.TL_DIST.get();
             final int[]   topIdx  = KnnSearch.TL_IDX.get();
 
             if (!RequestParser.parse(req.content(), vec)) {
-                send(ctx, HttpResponseStatus.BAD_REQUEST, BUF_BAD_REQUEST, ka);
+                ctx.writeAndFlush(HTTP_BAD_REQUEST.duplicate(), ctx.voidPromise());
                 return;
             }
 
             KnnSearch.quantize(vec, vecInt8);
             KnnSearch.searchIVF(STORE, vec, vecInt8, topDist, topIdx, STORE.defaultNprobe);
 
-            send(ctx, HttpResponseStatus.OK,
-                    RESPONSES[KnnSearch.fraudCount(STORE, topIdx)], ka);
-        }
-
-        private static void send(ChannelHandlerContext ctx, HttpResponseStatus status,
-                                 ByteBuf body, boolean keepAlive) {
-            final ByteBuf slice = body.duplicate();
-            final FullHttpResponse res = new DefaultFullHttpResponse(
-                    HttpVersion.HTTP_1_1, status, slice, HEADERS_FACTORY, TRAILERS_FACTORY);
-
-            res.headers()
-                    .set(HttpHeaderNames.CONTENT_TYPE,     CONTENT_TYPE_JSON)
-                    .setInt(HttpHeaderNames.CONTENT_LENGTH, slice.readableBytes());
-
-            if (keepAlive) {
-                res.headers().set(CONNECTION, KEEP_ALIVE_VALUE);
-                ctx.writeAndFlush(res, ctx.voidPromise());
-            } else {
-                ctx.writeAndFlush(res).addListener(ChannelFutureListener.CLOSE);
-            }
+            ctx.writeAndFlush(
+                    HTTP_OK_RESPONSES[KnnSearch.fraudCount(STORE, topIdx)].duplicate(),
+                    ctx.voidPromise());
         }
 
         @Override
@@ -308,3 +304,4 @@ public final class Main {
         }
     }
 }
+

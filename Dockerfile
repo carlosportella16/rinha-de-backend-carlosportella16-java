@@ -36,7 +36,7 @@ CMD java \
     --add-opens java.base/sun.misc=ALL-UNNAMED \
     --sun-misc-unsafe-memory-access=allow \
     -XX:+UseSerialGC \
-    -Xms100m -Xmx100m \
+    -Xms120m -Xmx120m \
     -XX:+AlwaysPreTouch \
     -XX:+TieredCompilation \
     -XX:CompileThreshold=500 \
