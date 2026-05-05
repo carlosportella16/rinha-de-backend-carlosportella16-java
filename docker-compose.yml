@@ -36,11 +36,11 @@ services:
     volumes:
       - sockets:/run/api
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:9998/ready || exit 1"]
+      test: ["CMD-SHELL", "test -f /tmp/ready"]
       interval: 5s
       timeout: 3s
-      retries: 20
-      start_period: 90s
+      retries: 24
+      start_period: 120s
     deploy:
       resources:
         limits:
@@ -65,11 +65,11 @@ services:
     volumes:
       - sockets:/run/api
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:9998/ready || exit 1"]
+      test: ["CMD-SHELL", "test -f /tmp/ready"]
       interval: 5s
       timeout: 3s
-      retries: 20
-      start_period: 90s
+      retries: 24
+      start_period: 120s
     deploy:
       resources:
         limits:

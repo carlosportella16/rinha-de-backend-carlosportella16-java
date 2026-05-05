@@ -63,6 +63,8 @@ public final class Main {
     static volatile boolean   READY = false;
 
     public static void main(String[] args) throws Exception {
+        Files.deleteIfExists(Paths.get("/tmp/ready"));
+
         // Use Epoll when available (Linux in production) — fewer syscalls, ~15% I/O improvement
         final boolean useEpoll = Epoll.isAvailable();
 
@@ -153,6 +155,7 @@ public final class Main {
             System.out.printf("Warmup done in %d ms%n", System.currentTimeMillis() - t);
 
             READY = true;
+            Files.writeString(Paths.get("/tmp/ready"), "OK");
             System.out.println("Ready.");
 
             channel.closeFuture().sync();
