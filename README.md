@@ -9,31 +9,6 @@ The challenge: serve KNN-based fraud scores over 3 million vectors with **p99 �
 
 ---
 
-## Benchmark Results (local, macOS)
-
-All runs: **0 HTTP errors · 0 detection failures** (`det_cut_triggered = 0`)
-
-| Run | Requests | p50 | p90 | p99 | Throughput | score_p99 | score_det | **final_score** |
-|-----|----------|-----|-----|-----|-----------|-----------|-----------|-----------------|
-| Best | 200 | 2.7 ms | 10.0 ms | **15.2 ms** | 274 rps | 1818 | 3000 | **4818** |
-| Run 2 | 500 | — | — | 20.2 ms | — | 1694 | 3000 | 4694 |
-| Run 3 | 500 | — | — | 35.7 ms | 390 rps | 1447 | 3000 | 4447 |
-
-> These numbers are from a **MacBook** (ARM, single Docker instance, dev environment).  
-> On the contest machine (Mac Mini 2014, Ubuntu 24.04, linux/amd64) with two real instances behind nginx, the expected p99 is significantly lower due to Epoll + parallel load distribution.
-
-### Scoring Formula
-
-```
-score_p99 = 1000 × log₁₀(1000 / max(p99_ms, 1))    ceiling +3000 (p99 ≤ 1ms), floor −3000 (p99 > 2000ms)
-score_det = 1000 × log₁₀(1/ε) − 300 × log₁₀(1+E)   floor −3000 if failure_rate > 15%
-final_score = score_p99 + score_det                   range: [−6000, +6000]
-```
-
-Weights: `FP = 1`, `FN = 3`, `HTTP error = 5`. Keeping detection correct (`score_det = 3000`) is as valuable as cutting p99 from 10ms → 1ms.
-
----
-
 ## Architecture
 
 ```
