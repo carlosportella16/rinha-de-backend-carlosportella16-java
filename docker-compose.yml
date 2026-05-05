@@ -14,7 +14,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.05"
+          cpus: "0.10"
           memory: "30MB"
     security_opt:
       - seccomp:unconfined
@@ -30,7 +30,7 @@ services:
     environment:
       - VECTORS_BIN=/data/references.bin
       - SERVER_PORT=9998
-      - NPROBE=4
+      - NPROBE=8
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/ready"]
       interval: 2s
@@ -40,7 +40,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.475"
+          cpus: "0.45"
           memory: "160MB"
     security_opt:
       - seccomp:unconfined
@@ -56,7 +56,7 @@ services:
     environment:
       - VECTORS_BIN=/data/references.bin
       - SERVER_PORT=9998
-      - NPROBE=4
+      - NPROBE=8
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/ready"]
       interval: 2s
@@ -66,7 +66,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.475"
+          cpus: "0.45"
           memory: "160MB"
     security_opt:
       - seccomp:unconfined
@@ -76,7 +76,6 @@ services:
         hard: 65535
     networks:
       - rinha
-
 
 networks:
   rinha:
