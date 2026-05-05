@@ -1,2 +1,4 @@
-# The dataset is too large for git — download from the contest repository
+# The dataset files are too large for git — download from the contest repository
 references.json.gz
+# Pre-built binary (generated from references.json.gz by ReferenceConverter)
+references.bin
