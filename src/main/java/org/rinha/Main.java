@@ -8,13 +8,17 @@ import io.netty.channel.*;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.epoll.Epoll;
 import io.netty.channel.epoll.EpollIoHandler;
+import io.netty.channel.epoll.EpollServerDomainSocketChannel;
 import io.netty.channel.epoll.EpollServerSocketChannel;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.unix.DomainSocketAddress;
 import io.netty.handler.codec.http.*;
 import io.netty.util.AsciiString;
 import io.netty.util.CharsetUtil;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 
 public final class Main {
 
@@ -74,6 +78,7 @@ public final class Main {
         final MultiThreadIoEventLoopGroup boss   = new MultiThreadIoEventLoopGroup(1, ioFactory);
         final MultiThreadIoEventLoopGroup worker = new MultiThreadIoEventLoopGroup(2, ioFactory);
 
+        // TCP listener — always active; used by health checks (wget localhost:PORT/ready)
         final Channel channel = new ServerBootstrap()
                 .group(boss, worker)
                 .channel(channelClass)
@@ -83,15 +88,13 @@ public final class Main {
                 .childOption(ChannelOption.SO_KEEPALIVE, false)
                 .childOption(ChannelOption.SO_RCVBUF, 16384)
                 .childOption(ChannelOption.SO_SNDBUF, 16384)
-                // PooledByteBufAllocator: reuses buffer memory → less GC pressure
                 .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                 .childHandler(new ChannelInitializer<SocketChannel>() {
                     @Override
                     protected void initChannel(SocketChannel ch) {
                         ch.pipeline()
                                 .addLast(new HttpServerCodec())
-                                // 8 KB max body size — real payloads are ~500 bytes;
-                                // smaller limit means less zeroing on buffer allocation
+                                // 8 KB max body size — real payloads are ~500 bytes
                                 .addLast(new HttpObjectAggregator(8192))
                                 .addLast(RequestHandler.INSTANCE);
                     }
@@ -99,6 +102,31 @@ public final class Main {
                 .bind(PORT)
                 .sync()
                 .channel();
+
+        // Unix Domain Socket listener — HAProxy routes real traffic here when SOCKET_PATH is set.
+        // UDS bypasses the kernel TCP stack entirely, saving ~1–2 µs per request on the
+        // LB→backend hop. TCP (above) stays alive for health checks only.
+        final String socketPath = System.getenv("SOCKET_PATH");
+        if (socketPath != null && !socketPath.isEmpty() && useEpoll) {
+            Files.deleteIfExists(Paths.get(socketPath));
+            new ServerBootstrap()
+                    .group(boss, worker)
+                    .channel(EpollServerDomainSocketChannel.class)
+                    .option(ChannelOption.SO_BACKLOG, 1024)
+                    .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+                    .childHandler(new ChannelInitializer<Channel>() {
+                        @Override
+                        protected void initChannel(Channel ch) {
+                            ch.pipeline()
+                                    .addLast(new HttpServerCodec())
+                                    .addLast(new HttpObjectAggregator(8192))
+                                    .addLast(RequestHandler.INSTANCE);
+                        }
+                    })
+                    .bind(new DomainSocketAddress(socketPath))
+                    .sync();
+            System.out.println("Unix socket: " + socketPath);
+        }
 
         try {
             final String binPath = System.getenv().getOrDefault("VECTORS_BIN", "/data/references.bin");
