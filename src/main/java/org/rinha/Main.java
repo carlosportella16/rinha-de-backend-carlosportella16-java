@@ -24,51 +24,53 @@ public final class Main {
     private static final int PORT = Integer.parseInt(
             System.getenv().getOrDefault("SERVER_PORT", "9999"));
 
-    /*
-     * Pre-build complete HTTP/1.1 200 OK responses (headers + body) for each of the
-     * 6 possible fraud scores. Responses are written as raw ByteBuf — no
-     * DefaultFullHttpResponse allocation per request. Zero GC pressure on hot path.
-     * fraud_score = n/5 for n ∈ {0,1,2,3,4,5}
-     */
-    private static final ByteBuf[] HTTP_OK_RESPONSES = buildHttpResponses();
+    // ── Pre-built JSON bodies (unreleasable — bytes are never freed) ──────────
+    // fraud_score = n/5 for n ∈ {0,1,2,3,4,5}
+    private static final String[] OK_JSON = {
+        "{\"approved\":true,\"fraud_score\":0.0}",
+        "{\"approved\":true,\"fraud_score\":0.2}",
+        "{\"approved\":true,\"fraud_score\":0.4}",
+        "{\"approved\":false,\"fraud_score\":0.6}",
+        "{\"approved\":false,\"fraud_score\":0.8}",
+        "{\"approved\":false,\"fraud_score\":1.0}",
+    };
+    private static final ByteBuf[] OK_BODIES  = new ByteBuf[OK_JSON.length];
+    private static final int[]     OK_LENGTHS = new int[OK_JSON.length];
 
-    private static ByteBuf[] buildHttpResponses() {
-        final String[] bodies = {
-            "{\"approved\":true,\"fraud_score\":0.0}",
-            "{\"approved\":true,\"fraud_score\":0.2}",
-            "{\"approved\":true,\"fraud_score\":0.4}",
-            "{\"approved\":false,\"fraud_score\":0.6}",
-            "{\"approved\":false,\"fraud_score\":0.8}",
-            "{\"approved\":false,\"fraud_score\":1.0}",
-        };
-        final ByteBuf[] r = new ByteBuf[bodies.length];
-        for (int i = 0; i < bodies.length; i++) {
-            r[i] = rawHttpResponse(200, "OK", "application/json", bodies[i]);
+    static {
+        for (int i = 0; i < OK_JSON.length; i++) {
+            final byte[] b = OK_JSON[i].getBytes(CharsetUtil.US_ASCII);
+            OK_BODIES[i]  = Unpooled.unreleasableBuffer(
+                    Unpooled.directBuffer(b.length).writeBytes(b));
+            OK_LENGTHS[i] = b.length;
         }
-        return r;
     }
 
-    private static final ByteBuf HTTP_BAD_REQUEST         = rawHttpResponse(400, "Bad Request",
-            "text/plain", "Bad Request");
-    private static final ByteBuf HTTP_NOT_FOUND           = rawHttpResponse(404, "Not Found",
-            "text/plain", "Not Found");
-    private static final ByteBuf HTTP_METHOD_NOT_ALLOWED  = rawHttpResponse(405, "Method Not Allowed",
-            "text/plain", "Method Not Allowed");
-    private static final ByteBuf HTTP_SERVICE_UNAVAILABLE = rawHttpResponse(503, "Service Unavailable",
-            "text/plain", "Starting");
-    private static final ByteBuf HTTP_READY_OK            = rawHttpResponse(200, "OK",
-            "text/plain", "OK");
+    // ── Pre-built error/status responses (full FullHttpResponse objects) ──────
+    // These are created once at startup; since they're rare paths (not hot),
+    // we recreate them per call rather than fighting ref-count sharing.
 
-    private static ByteBuf rawHttpResponse(int status, String statusText,
-                                            String contentType, String body) {
-        final String http = "HTTP/1.1 " + status + " " + statusText + "\r\n"
-                + "Content-Type: " + contentType + "\r\n"
-                + "Content-Length: " + body.length() + "\r\n"
-                + "Connection: keep-alive\r\n\r\n"
-                + body;
-        final byte[] bytes = http.getBytes(CharsetUtil.US_ASCII);
-        return Unpooled.unreleasableBuffer(
-                Unpooled.directBuffer(bytes.length).writeBytes(bytes));
+    // Sentinel bodies for non-hot paths (recreated per use via makeResp)
+    private static final ByteBuf BODY_BAD_REQUEST  = bodyBuf("Bad Request");
+    private static final ByteBuf BODY_NOT_FOUND    = bodyBuf("Not Found");
+    private static final ByteBuf BODY_METHOD_NA    = bodyBuf("Method Not Allowed");
+    private static final ByteBuf BODY_STARTING     = bodyBuf("Starting");
+    private static final ByteBuf BODY_READY        = bodyBuf("OK");
+
+    private static ByteBuf bodyBuf(String s) {
+        final byte[] b = s.getBytes(CharsetUtil.US_ASCII);
+        return Unpooled.unreleasableBuffer(Unpooled.directBuffer(b.length).writeBytes(b));
+    }
+
+    private static DefaultFullHttpResponse makeResp(HttpResponseStatus status,
+                                                     ByteBuf body, int len,
+                                                     CharSequence ct) {
+        final DefaultFullHttpResponse r = new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1, status, body.duplicate());
+        r.headers()
+                .set(HttpHeaderNames.CONTENT_TYPE, ct)
+                .setInt(HttpHeaderNames.CONTENT_LENGTH, len);
+        return r;
     }
 
     static OffHeapVectorStore STORE;
@@ -110,8 +112,9 @@ public final class Main {
                     @Override
                     protected void initChannel(SocketChannel ch) {
                         ch.pipeline()
-                                // Decode only — responses are raw ByteBuf, no encoder needed
-                                .addLast(new HttpRequestDecoder(4096, 8192, 8192))
+                                // Full codec — decoder + encoder required for correct
+                                // HTTP/1.1 connection management with HAProxy keep-alive.
+                                .addLast(new HttpServerCodec(4096, 8192, 8192))
                                 // 8 KB max body size — real payloads are ~500 bytes
                                 .addLast(new HttpObjectAggregator(8192))
                                 .addLast(RequestHandler.INSTANCE);
@@ -136,7 +139,7 @@ public final class Main {
                         @Override
                         protected void initChannel(Channel ch) {
                             ch.pipeline()
-                                    .addLast(new HttpRequestDecoder(4096, 8192, 8192))
+                                    .addLast(new HttpServerCodec(4096, 8192, 8192))
                                     .addLast(new HttpObjectAggregator(8192))
                                     .addLast(RequestHandler.INSTANCE);
                         }
@@ -247,7 +250,9 @@ public final class Main {
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest req) {
             if (!READY) {
-                ctx.writeAndFlush(HTTP_SERVICE_UNAVAILABLE.duplicate(), ctx.voidPromise());
+                ctx.writeAndFlush(makeResp(HttpResponseStatus.SERVICE_UNAVAILABLE,
+                        BODY_STARTING, BODY_STARTING.capacity(),
+                        HttpHeaderValues.TEXT_PLAIN), ctx.voidPromise());
                 return;
             }
 
@@ -258,26 +263,36 @@ public final class Main {
                 if (HttpMethod.POST.equals(m)) {
                     handleFraudScore(ctx, req);
                 } else {
-                    ctx.writeAndFlush(HTTP_METHOD_NOT_ALLOWED.duplicate(), ctx.voidPromise());
+                    ctx.writeAndFlush(makeResp(HttpResponseStatus.METHOD_NOT_ALLOWED,
+                            BODY_METHOD_NA, BODY_METHOD_NA.capacity(),
+                            HttpHeaderValues.TEXT_PLAIN), ctx.voidPromise());
                 }
                 return;
             }
 
             if ("/ready".equals(uri)) {
                 if (HttpMethod.GET.equals(m)) {
-                    ctx.writeAndFlush(HTTP_READY_OK.duplicate(), ctx.voidPromise());
+                    ctx.writeAndFlush(makeResp(HttpResponseStatus.OK,
+                            BODY_READY, BODY_READY.capacity(),
+                            HttpHeaderValues.TEXT_PLAIN), ctx.voidPromise());
                 } else {
-                    ctx.writeAndFlush(HTTP_METHOD_NOT_ALLOWED.duplicate(), ctx.voidPromise());
+                    ctx.writeAndFlush(makeResp(HttpResponseStatus.METHOD_NOT_ALLOWED,
+                            BODY_METHOD_NA, BODY_METHOD_NA.capacity(),
+                            HttpHeaderValues.TEXT_PLAIN), ctx.voidPromise());
                 }
                 return;
             }
 
-            ctx.writeAndFlush(HTTP_NOT_FOUND.duplicate(), ctx.voidPromise());
+            ctx.writeAndFlush(makeResp(HttpResponseStatus.NOT_FOUND,
+                    BODY_NOT_FOUND, BODY_NOT_FOUND.capacity(),
+                    HttpHeaderValues.TEXT_PLAIN), ctx.voidPromise());
         }
 
         /**
-         * POST /fraud-score handler — ZERO heap allocations per request.
-         * All scratch buffers are ThreadLocal; response is a pre-built static ByteBuf.
+         * POST /fraud-score handler.
+         * Body ByteBufs are pre-built and unreleasable; only the FullHttpResponse
+         * wrapper (~200 bytes) is allocated per request. Headers are set inline
+         * (no extra objects).
          */
         private static void handleFraudScore(ChannelHandlerContext ctx, FullHttpRequest req) {
             final float[] vec     = RequestParser.TL_VEC.get();
@@ -286,16 +301,23 @@ public final class Main {
             final int[]   topIdx  = KnnSearch.TL_IDX.get();
 
             if (!RequestParser.parse(req.content(), vec)) {
-                ctx.writeAndFlush(HTTP_BAD_REQUEST.duplicate(), ctx.voidPromise());
+                ctx.writeAndFlush(makeResp(HttpResponseStatus.BAD_REQUEST,
+                        BODY_BAD_REQUEST, BODY_BAD_REQUEST.capacity(),
+                        HttpHeaderValues.TEXT_PLAIN), ctx.voidPromise());
                 return;
             }
 
             KnnSearch.quantize(vec, vecInt8);
             KnnSearch.searchIVF(STORE, vec, vecInt8, topDist, topIdx, STORE.defaultNprobe);
 
-            ctx.writeAndFlush(
-                    HTTP_OK_RESPONSES[KnnSearch.fraudCount(STORE, topIdx)].duplicate(),
-                    ctx.voidPromise());
+            final int fc = KnnSearch.fraudCount(STORE, topIdx);
+            final DefaultFullHttpResponse resp = new DefaultFullHttpResponse(
+                    HttpVersion.HTTP_1_1, HttpResponseStatus.OK,
+                    OK_BODIES[fc].duplicate());
+            resp.headers()
+                    .set(HttpHeaderNames.CONTENT_TYPE, HttpHeaderValues.APPLICATION_JSON)
+                    .setInt(HttpHeaderNames.CONTENT_LENGTH, OK_LENGTHS[fc]);
+            ctx.writeAndFlush(resp, ctx.voidPromise());
         }
 
         @Override
