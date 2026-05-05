@@ -2,6 +2,6 @@
     "participants": ["Carlos Portella"],
     "social": ["https://github.com/carlosportella16"],
     "source-code-repo": "https://github.com/carlosportella16/rinha-de-backend-carlosportella16-java",
-    "stack": ["java", "netty", "nginx"],
+    "stack": ["java", "netty", "haproxy"],
     "open_to_work": false
 }
