@@ -135,9 +135,10 @@ public final class Main {
     }
 
     /**
-     * Runs 10,000 IVF searches with pseudo-random query vectors.
-     * Uses XorShift64 — no allocation, deterministic, covers full [-1,1] range.
-     * Results discarded; side effect is JIT compilation of the hot path.
+     * Runs 10,000 synthetic searches before opening for traffic.
+     * This lets the JIT compile the hot path (distSqInt8, searchIVF, etc.)
+     * to native code — including SIMD — before the first real request arrives.
+     * Uses XorShift64 for random vectors: no allocation, no I/O, deterministic.
      */
     private static void warmup(final OffHeapVectorStore store) {
         final float[] vec      = new float[OffHeapVectorStore.DIMS];
@@ -162,9 +163,9 @@ public final class Main {
     }
 
     /**
-     * Warm up the RequestParser's byte[] hot path so it is C2-compiled before
-     * the first real request arrives.  Uses a minimal but valid JSON body that
-     * exercises every code branch (hasLast=true and hasLast=false).
+     * Warms up RequestParser so it is JIT-compiled before traffic arrives.
+     * Uses a minimal but complete JSON body that covers both branches
+     * (with and without last_transaction).
      */
     private static void warmupParser() {
         // A minimal fraud-score body with last_transaction present
@@ -228,12 +229,10 @@ public final class Main {
         }
 
         /**
-         * Hot path — POST /fraud-score.
-         * Zero heap allocations after warmup (all scratch arrays are ThreadLocal).
-         *
-         * Per-call unavoidable allocations (HTTP/1.1 framing):
-         *   1. body.duplicate()        — DuplicatedByteBuf (shared bytes)
-         *   2. DefaultFullHttpResponse — per-response headers
+         * POST /fraud-score handler.
+         * After JIT warmup this allocates nothing per request — all scratch
+         * buffers are ThreadLocal. The only two allocations that can't be
+         * avoided are the Netty response wrapper objects required by HTTP/1.1.
          */
         private static void handleFraudScore(ChannelHandlerContext ctx,
                                              FullHttpRequest req, boolean ka) {

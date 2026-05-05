@@ -7,10 +7,11 @@ import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
 
 /**
- * Top-5 nearest-neighbor search.
+ * Top-5 nearest-neighbor search over the IVF vector index.
  *
- * Production path: searchIVF — IVF index with INT8 distances.
- * Test/fallback path: search / searchIndexed — VectorStore (heap float32).
+ * The main entry point is searchIVF(), which is called for every
+ * /fraud-score request. The other search methods (search, searchIndexed)
+ * are slower brute-force paths used only in unit tests.
  */
 final class KnnSearch {
 
@@ -54,18 +55,19 @@ final class KnnSearch {
     // ── IVF search (production path) ─────────────────────────────────────────
 
     /**
-     * Searches the IVF index for the K nearest neighbors.
+     * The main K-NN search. Called once per /fraud-score request.
      *
-     * Phase 1 — centroid selection:
-     *   nprobe=1 fast path: pure argmin with early-termination centroid dist.
-     *   General path: sorted top-nprobe via TL scratch arrays, also with ET.
+     * Phase 1: compare the query against all cluster centroids (float32)
+     *          and pick the nprobe closest ones. Uses early termination —
+     *          once a close centroid is found, distant ones are rejected
+     *          after checking just 1-3 dimensions instead of all 14.
      *
-     * Phase 2 — candidate evaluation:
-     *   Sequential vb += DIMS stride into flat byte[] + static distSqInt8 call.
-     *   Static method uses return for early exit — cleaner control flow for JIT
-     *   than inlined continue, and avoids the (off+li)*DIMS multiply each step.
+     * Phase 2: scan every vector in each of those nprobe clusters using
+     *          INT8 SIMD distance. The top-5 heap tightens as better
+     *          neighbors are found, which causes early termination to
+     *          skip more and more vectors as the scan progresses.
      *
-     * All scratch arrays are ThreadLocal — zero heap allocation per call.
+     * All scratch buffers are ThreadLocal — zero heap allocation per call.
      */
     static void searchIVF(final OffHeapVectorStore store,
                           final float[]            query,
@@ -82,15 +84,13 @@ final class KnnSearch {
         final int[]   listOffsets= store.listOffsets;
         final int[]   listSizes  = store.listSizes;
         final int     bound      = Math.min(nprobe, C);
-        // Hoist flat array reference — avoids repeated field load through store
-        // on every call to distSqInt8 inside the inner loop.
+        // Local reference so the JIT sees a single load instead of repeated
+        // field accesses through 'store' inside the inner distance loop.
         final byte[]  vecs       = store.vectors;
 
         // ── Phase 1 — nprobe=1 fast path ─────────────────────────────────────
-        // Pure argmin with early-termination centroid distance:
-        // once bestDist tightens, centDistSqEt prunes dim-by-dim → ~3-5x fewer
-        // float ops vs scanning all 14 dims for every centroid.
-        // No ThreadLocal.get() / scratch array needed.
+        // When only one cluster is requested, we just need the best centroid.
+        // No sorted list, no scratch arrays.
         if (bound == 1) {
             int   bestC    = 0;
             float bestDist = Float.MAX_VALUE;
@@ -99,9 +99,8 @@ final class KnnSearch {
                 if (cd < bestDist) { bestDist = cd; bestC = c; }
             }
 
-            // ── Phase 2 (nprobe=1) ────────────────────────────────────────────
-            // Bbox check omitted: worstInt=MAX_VALUE at entry → lb < MAX_VALUE always
-            // → check would never prune the sole cluster → skip it entirely.
+            // Skip bbox check for nprobe=1: the top-5 heap starts empty
+            // (worstInt = MAX_VALUE), so the lower-bound check can never prune.
             final int off = listOffsets[bestC];
             final int sz  = listSizes[bestC];
             int worstInt  = Integer.MAX_VALUE;
@@ -125,8 +124,8 @@ final class KnnSearch {
         float probeWorst = Float.MAX_VALUE;
 
         for (int c = 0; c < C; c++) {
-            // centDistSqEt uses probeWorst as threshold: once top-nprobe are known,
-            // most remaining centroids are pruned after 1-3 dimensions.
+            // probeWorst tightens as the top-nprobe list fills up, so later
+            // centroids get rejected after just 1-3 dimensions instead of 14.
             final float cd = centDistSqEt(query, centroids, c, probeWorst);
             if (cd < probeWorst) {
                 insertProbe(probeDist, probeIdx, cd, c, bound);
@@ -187,17 +186,12 @@ final class KnnSearch {
     // ── Centroid distance with early termination ──────────────────────────────
 
     /**
-     * Float32 squared distance from query {@code q} to centroid {@code ci}, with
-     * early exit when the partial sum already exceeds {@code threshold}.
+     * Distance from query q to centroid ci, stopping early if the running
+     * total already beats the threshold. Safe to return early because all
+     * squared terms are non-negative — the full sum can only be larger.
      *
-     * Used in Phase 1: once a close centroid is found, {@code threshold = bestDist}
-     * tightens on each improvement.  Most of the remaining 512 centroids can then
-     * be rejected after just 1-3 dimensions instead of all 14, saving ~3-5× float
-     * ops vs the no-ET version.
-     *
-     * Correctness: all squared terms are ≥ 0, so partial_sum ≤ full_sum.  If
-     * partial_sum ≥ threshold then full_sum ≥ threshold, and returning the partial
-     * sum is safe — the caller only checks {@code cd < threshold}.
+     * In practice this rejects most centroids after 1-3 dimensions once
+     * the search has found a reasonably close cluster to compare against.
      */
     private static float centDistSqEt(final float[] q, final float[] c,
                                       final int ci, final float threshold) {
@@ -222,27 +216,27 @@ final class KnnSearch {
 
     // ── INT8 vector distance (static, for Phase 2 hot loop) ──────────────────
 
-    // Panama Vector API species — initialized once at class load.
-    // On x86+AVX2 the JIT emits a single VPMOVSX + VPMULLD + VPHADDD sequence;
-    // on ARM NEON it uses two 128-bit passes (still faster than 8 scalar iterations).
+    // SIMD lane widths for the INT8 distance calculation.
+    // We load 8 bytes at once, widen to shorts (so subtraction doesn't overflow),
+    // widen again to ints (so squaring doesn't overflow), then sum.
     private static final VectorSpecies<Byte>    BYTE_SPEC  = ByteVector.SPECIES_64;
     private static final VectorSpecies<Short>   SHORT_SPEC = ShortVector.SPECIES_128;
     private static final VectorSpecies<Integer> INT_SPEC   = IntVector.SPECIES_256;
 
     /**
-     * Squared Euclidean distance (INT8² scale) between {@code q} and the stored
-     * vector at byte offset {@code base} in {@code vecs}, with early exit.
+     * Squared distance between query vector q and one stored vector in vecs[].
+     * Returns early if the partial sum already exceeds threshold (the current
+     * worst distance in our top-5 heap), because the full distance can only
+     * grow — there's no point continuing.
      *
-     * Dims 0-7: Panama Vector API SIMD — B→S sign-extension, subtract as shorts
-     *   (max |diff| = 254, fits in short), S→I sign-extension, multiply as ints,
-     *   horizontal ADD reduce.  One SIMD burst replaces 8 scalar squarings.
-     * Dims 8-13: scalar early-termination (can't safely over-read the 14-byte q[]).
-     *
-     * Max result: (127+127)² × 14 = 903,224 — fits in int.
+     * Dims 0-7 use SIMD: 8 bytes loaded at once, widened to int, squared and
+     * summed in a single hardware burst. Dims 8-13 are scalar because the
+     * query array is only 14 bytes wide — we can't safely load 8 bytes starting
+     * at index 8 without reading past the end of the array.
      */
     private static int distSqInt8(final byte[] q, final byte[] vecs,
                                   final int base, final int threshold) {
-        // Dims 0-7: SIMD
+        // Dims 0-7: load 8 bytes from each, widen byte→short→int, subtract, square, sum
         final ShortVector qS = (ShortVector) ByteVector.fromArray(BYTE_SPEC, q, 0)
                 .convertShape(VectorOperators.B2S, SHORT_SPEC, 0);
         final ShortVector vS = (ShortVector) ByteVector.fromArray(BYTE_SPEC, vecs, base)
@@ -251,7 +245,7 @@ final class KnnSearch {
                 .convertShape(VectorOperators.S2I, INT_SPEC, 0);
         int sum = dI.mul(dI).reduceLanes(VectorOperators.ADD);
         if (sum >= threshold) return sum;
-        // Dims 8-13: scalar
+        // Dims 8-13: scalar early-exit
         int d;
         d = q[8]  - vecs[base+8];   sum += d*d; if (sum >= threshold) return sum;
         d = q[9]  - vecs[base+9];   sum += d*d; if (sum >= threshold) return sum;

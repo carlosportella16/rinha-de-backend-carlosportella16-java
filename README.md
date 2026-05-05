@@ -1,431 +1,361 @@
-# Rinha de Backend 2026 — Fraud Detection via Vector Search
+# Rinha de Backend 2026 — Fraud Detection via K-NN Search
 
-> **Carlos Portella** · Java 25 · Netty 4.2 · IVF + INT8 · Off-Heap · Epoll
+> **Carlos Portella** · Java 25 · Netty 4.2 · IVF + INT8 + SIMD · nginx
 
-A **high-performance fraud detection API** built for [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026).  
 **Repository:** https://github.com/carlosportella16/rinha-de-backend-carlosportella16-java
 
-The challenge: serve KNN-based fraud scores over 3 million vectors with **p99 ≤ 1 ms**, using only **1 CPU and 350 MB RAM** across two API instances + one load balancer.
+---
+
+## The Challenge
+
+The goal: classify every financial transaction as fraud or not by finding its **5 nearest neighbors** across a dataset of **3 million labeled vectors** (14 dimensions each). The API must return a fraud score (`approved` + `fraud_score`) for every POST request.
+
+The constraint: **1.00 CPU and 350 MB RAM** total, shared across two API instances and a load balancer. The scoring formula rewards low p99 latency — the closer to 1 ms, the more points.
+
+Three million 14-dimension float32 vectors take 168 MB per instance — already over budget before running any code. A brute-force KNN scan would take ~15 ms per query. Neither is viable. Everything in this solution is about solving those two problems without sacrificing detection accuracy.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Host (1 CPU / 350 MB)                    │
-│                                                                 │
-│   ┌──────────────────────────────────────────────────────────┐  │
-│   │  nginx 1.27-alpine  (0.05 CPU / 16 MB)   :9999          │  │
-│   │  round-robin upstream, keepalive 64, epoll, tcp_nodelay  │  │
-│   └────────────────────┬─────────────────────┬───────────────┘  │
-│                        │                     │                  │
-│          ┌─────────────▼──────┐   ┌──────────▼─────────┐       │
-│          │  api1  :9998       │   │  api2  :9998        │       │
-│          │  0.475 CPU / 167MB │   │  0.475 CPU / 167MB  │       │
-│          │  Java 25 + Netty   │   │  Java 25 + Netty    │       │
-│          └────────────────────┘   └─────────────────────┘       │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                     Host  (1.00 CPU / 350 MB)                │
+│                                                              │
+│   ┌────────────────────────────────────────────────────┐     │
+│   │  nginx 1.27-alpine   0.05 CPU / 12 MB   port 9999  │     │
+│   │  round-robin, keepalive upstream, epoll             │     │
+│   └────────────┬──────────────────────────┬────────────┘     │
+│                │                          │                  │
+│   ┌────────────▼─────────┐   ┌────────────▼─────────┐        │
+│   │  api1   port 9998    │   │  api2   port 9998    │        │
+│   │  0.475 CPU / 169 MB  │   │  0.475 CPU / 169 MB  │        │
+│   │  Java 25 + Netty     │   │  Java 25 + Netty     │        │
+│   │  3M vectors in RAM   │   │  3M vectors in RAM   │        │
+│   └──────────────────────┘   └──────────────────────┘        │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-Each API instance is **fully independent** — no database, no shared cache, no inter-process communication. The entire 3M-vector index is loaded in off-heap memory at startup.
+Each API instance is fully independent — no database, no shared state, no inter-process communication. Both load the entire vector index at startup and serve every request from RAM.
 
-### Request Pipeline
+---
+
+## How a Request Flows
 
 ```
-POST /fraud-score
+POST /fraud-score  (~500 byte JSON body)
   │
-  ├─ Netty EpollEventLoop (Linux) / NioEventLoop (macOS/dev)
-  │   └─ 1 boss thread + 2 worker threads per instance
+  ├─ Netty EpollEventLoop (Linux) / NioEventLoop (macOS)
+  │   2 worker threads per instance
   │
-  ├─ HttpServerCodec + HttpObjectAggregator (64 KB max body)
+  ├─ RequestParser.parse(ByteBuf)                    ≈ 0.02 ms
+  │   Copies body into a thread-local byte[] once,
+  │   then scans bytes directly — no String, no Jackson,
+  │   no Date parsing, no object allocation.
+  │   Output: float[14] feature vector in TL_VEC
   │
-  ├─ RequestParser.parse(ByteBuf)                    ~0.02 ms
-  │   ├─ Raw byte scan — no String, no Jackson
-  │   ├─ ISO-8601 → epoch-minutes (pure integer math)
-  │   └─ Writes float[14] into ThreadLocal TL_VEC
+  ├─ KnnSearch.quantize(float[14] → byte[14])        ≈ 0.001 ms
+  │   Shrinks each float to a signed byte: f × 127, rounded.
+  │   This is what Phase 2 compares against.
   │
-  ├─ KnnSearch.quantize(float[14] → byte[14])        ~0.001 ms
-  │   └─ f × 127 + round, clamped [-127, 127]
+  ├─ KnnSearch.searchIVF(...)                        ≈ 0.1–2 ms
+  │   Phase 1: find the 8 closest cluster centroids (float32)
+  │   Phase 2: scan ~23k INT8 vectors in those clusters
+  │            using SIMD + early-exit distance
+  │   Output: top-5 nearest neighbor indices
   │
-  ├─ KnnSearch.searchIVF(store, vec, vecInt8, ...)   ~1–5 ms
-  │   ├─ Phase 1: scan 512 float32 centroids → top 32 (nprobe)
-  │   └─ Phase 2: scan ~185k INT8 vectors with early-exit distSq
+  ├─ KnnSearch.fraudCount(topIdx)                    ≈ 0.001 ms
+  │   Count how many of the 5 neighbors are labeled fraud.
   │
-  ├─ KnnSearch.fraudCount(topIdx[5])                 ~0.001 ms
-  │   └─ count labels == FRAUD among top-5
-  │
-  └─ RESPONSES[fraudCount].duplicate() + writeAndFlush
-      └─ Pre-built DirectByteBuf — zero JSON encoding
+  └─ RESPONSES[fraudCount].duplicate() → writeAndFlush
+      Pre-built response buffers — no JSON serialization at all.
 ```
 
 ---
 
-## Stack
+## The K-NN Algorithm: IVF + INT8
 
-| Component | Technology | Why |
-|-----------|-----------|-----|
-| Runtime | Java 25 (eclipse-temurin:25-jre) | `sun.misc.Unsafe` + `jdk.incubator.vector` + Panama |
-| HTTP Server | Netty 4.2 (no Spring) | Direct ByteBuf, Epoll, zero-copy |
-| Vector Index | Custom IVF V4 (K-Means C=512) | No dependency, full control over memory layout |
-| Off-heap Storage | `ByteBuffer.allocateDirect` + `sun.misc.Unsafe` | Bypasses GC, raw `getByte` with no bounds check |
-| Quantization | INT8 (1 byte/dim vs 4 for float32) | 4× smaller → fits L2 cache better |
-| Load Balancer | nginx 1.27-alpine | Minimal CPU footprint, native Epoll, keepalive upstream |
-| Build | Maven 3.9 + maven-shade-plugin | Fat JAR with no external files at runtime |
-| SIMD | JDK Vector API (`jdk.incubator.vector`, JEP 508) | AVX2/AVX-512 for centroid distance in Phase 1 |
+Searching 3 million vectors for every request would take ~15 ms on this hardware. The solution uses two techniques to make it fast enough.
+
+### Inverted File Index (IVF)
+
+At build time, `ReferenceConverter` runs k-means clustering and divides the 3M vectors into **1024 clusters**. Each cluster gets a centroid (the average vector of all its members).
+
+At query time:
+1. **Phase 1** — compare the query against all 1024 centroids (fast, float32, ~1024 distance calculations)
+2. **Phase 2** — only search the 8 closest clusters (`nprobe = 8`), which contain about 23,000 vectors total
+
+```
+Strategy                       Vectors checked / query   Typical latency
+────────────────────────────────────────────────────────────────────────
+Brute force                    3,000,000                 ~15 ms
+IVF C=1024, nprobe=8           ~23,000  (0.78%)          ~0.2–1 ms
+IVF C=512,  nprobe=8           ~46,000  (1.56%)          ~0.4–2 ms
+```
+
+Doubling the cluster count from 512 to 1024 halves Phase 2 work while keeping the same coverage fraction (8/1024 = 0.78% — same as 4/512 was before). Tighter clusters also improve recall per probe.
+
+### INT8 Quantization
+
+The 3M reference vectors are converted from float32 to 1-byte integers at build time:
+
+```
+float f  →  byte q = round(f × 127), clamped to [-127, 127]
+```
+
+This shrinks the dataset from 168 MB to **42 MB** — small enough to fit two instances in 350 MB, and close enough to L3 cache to matter for Phase 2 scanning speed.
+
+Distance computations stay accurate: the squared INT8 distance differs from float32 by at most 0.04%, which has no effect on which 5 neighbors are closest.
+
+The binary file (`references.bin`) stores these quantized vectors in **cluster order** so Phase 2 is a sequential memory scan — no pointer chasing, no random access.
 
 ---
 
 ## Optimizations
 
-### 1. IVF Index — Inverted File Index ⭐⭐⭐⭐⭐
+### 1. IVF Cluster-Ordered Layout (V4 binary format)
 
-**The biggest single optimization.** Instead of computing distance to all 3M vectors per query:
+Vectors inside `references.bin` are stored cluster-by-cluster. When Phase 2 scans cluster 7, it reads bytes at a contiguous memory range. No indirection array needed. The CPU prefetcher can work ahead.
 
-1. **Offline (build time):** `ReferenceConverter` runs k-means on all 3M float32 vectors → `C = 512` centroids
-2. **Query time Phase 1:** Compute distance from query to all 512 centroids (float32) → select top `nprobe = 32` closest clusters
-3. **Query time Phase 2:** Scan only the vectors in those 32 clusters → ~185,000 INT8 distance computations
+V3 (old): `for each vector-index in listData[] → dereference → load bytes`
+V4 (current): `for offset in [clusterStart .. clusterStart + clusterSize] → load bytes`
 
-```
-Strategy           Vectors evaluated/query   Worst-case latency
-──────────────────────────────────────────────────────────────
-Brute force        3,000,000                 ~15 ms
-IVF C=512 nprobe=32  ~185,000 (~6%)          ~2 ms
-IVF C=512 nprobe=5     ~30,000 (~1%)         < 1 ms  (lower accuracy)
-```
+This eliminated 12 MB of indirection data and improved Phase 2 cache behavior.
 
-The index is persisted in **V4 binary format** (cluster-ordered) — loaded at container startup in milliseconds, no k-means at runtime.
+### 2. SIMD INT8 Distance (Panama Vector API)
 
-#### V4 Cluster-Ordered Format
+The inner distance loop in Phase 2 calls `distSqInt8` once per vector — ~23,000 times per query. Each call computes the squared Euclidean distance between the query byte vector and one stored vector.
 
-In V4, vectors are stored in **cluster order** in the binary file. Cluster 0's vectors come first, then cluster 1's, and so on. This eliminates the need for an indirection array (`listData[]` in V3), making Phase 2 a pure sequential memory scan:
+The original scalar implementation checked 14 dimensions one at a time. The SIMD version processes dims 0-7 in a single burst:
 
 ```
-V3 (indirect):   for each cluster c → for each idx in listData[off..off+sz] → distSqInt8(idx)
-V4 (direct):     for each cluster c → for each li in [off..off+sz]          → distSqInt8(off+li)
-```
-Sequential access = better CPU prefetch = fewer cache misses.
-
----
-
-### 2. INT8 Quantization — 42 MB instead of 168 MB ⭐⭐⭐⭐
-
-Converting float32 → int8 at build time shrinks the vector dataset 4×:
-
-```
-float f → byte q = round(f × 127), clamped to [-127, 127]
-
-Special case: sentinel -1.0 → -127 (for "no previous transaction" dims 5 and 6)
+byte[8] query  →  sign-extend to short[8]  →  subtract stored bytes  →  sign-extend to int[8]  →  multiply & sum
 ```
 
-| Format | Size (3M vectors × 14 dims) | Fits L3 cache? |
-|--------|----------------------------|----------------|
-| float32 | **168 MB** | No (typical L3: 8–32 MB) |
-| INT8 | **42 MB** | Better cache locality |
+The last 6 dimensions (8-13) remain scalar because the 14-byte query array can't safely be over-read with a full 8-byte SIMD load starting at index 8.
 
-This also enables **two instances** to fit within the 350 MB total limit:
+On Linux x86 with AVX2 (the contest environment), the JIT emits a compact sequence of SIMD instructions. After JIT warmup with the tuned compile thresholds (`-XX:Tier4CompileThreshold=250`), the Vector API objects are stack-allocated (no heap pressure).
 
-```
-Per instance:    42 MB vectors + 3 MB labels + 64 MB JVM heap + ~40 MB JVM overhead ≈ 149 MB
-Two instances:   149 × 2 = 298 MB + nginx 16 MB = 314 MB  ✓ under 350 MB
-```
+### 3. Early Termination in Distance Computation
 
-The `ReferenceConverter` performs quantization in a single pass when writing the binary — zero overhead at runtime.
-
----
-
-### 3. Early Termination in `distSqInt8` ⭐⭐⭐
-
-The inner distance loop exits as soon as the partial sum exceeds the current K-th worst distance (`threshold`):
+Both Phase 1 and Phase 2 stop computing a distance as soon as the partial sum exceeds the current worst distance in the top-5 heap:
 
 ```java
-int distSqInt8(final byte[] query, final int idx, final int threshold) {
-    final long base = vectorsAddr + (long)idx * 14;
-    int sum = 0, d;
-    d = (int)query[0]  - (int)UNSAFE.getByte(base);    sum += d*d; if (sum >= threshold) return sum;
-    d = (int)query[1]  - (int)UNSAFE.getByte(base+1);  sum += d*d; if (sum >= threshold) return sum;
-    d = (int)query[2]  - (int)UNSAFE.getByte(base+2);  sum += d*d; if (sum >= threshold) return sum;
-    // ... dims 3–12 same pattern ...
-    d = (int)query[13] - (int)UNSAFE.getByte(base+13); sum += d*d;
-    return sum;
+d = q[8] - vecs[base+8];  sum += d*d;  if (sum >= threshold) return sum;
+```
+
+As the query finds better neighbors, `threshold` tightens. By the time half the cluster is scanned, most vectors are rejected after 2-3 dimensions instead of all 14. This saves roughly 40-60% of Phase 2 distance calculations.
+
+### 4. Bounding Box Pruning
+
+For each cluster, the loader pre-computes the per-dimension min/max of all its INT8 vectors. Before entering Phase 2 for a cluster, the search checks the lower-bound distance from the query to that bounding box:
+
+```
+if lb_distance(query, cluster_bbox) >= worstDist → skip the entire cluster
+```
+
+Once the top-5 heap is warm, this prunes several clusters per query without touching any vector data.
+
+### 5. Zero-Allocation Hot Path
+
+Every buffer that would otherwise be allocated per-request lives in `ThreadLocal` storage, initialized once per IO thread:
+
+```
+TL_VEC        — float[14]  request feature vector
+TL_VEC_INT8   — byte[14]   quantized query
+TL_DIST       — float[5]   top-5 distances
+TL_IDX        — int[5]     top-5 indices
+TL_PROBE_DIST — float[128] centroid distances for nprobe selection
+TL_PROBE_IDX  — int[128]   cluster indices
+TL_BYTES      — byte[2048] raw request body copy
+```
+
+With 2 worker threads per instance, each of these arrays is allocated exactly twice per JVM lifetime. After JIT warmup, the hot path allocates zero bytes per request.
+
+### 6. Pre-encoded Static Responses
+
+The fraud score is always one of 6 possible values (0/5, 1/5, ... 5/5). All 6 JSON responses are encoded into static `DirectByteBuf` objects at startup:
+
+```java
+RESPONSES[0] = staticBuf("{\"approved\":true,\"fraud_score\":0.0}");
+RESPONSES[1] = staticBuf("{\"approved\":true,\"fraud_score\":0.2}");
+// ... up to RESPONSES[5]
+```
+
+Sending a response is one array lookup and one buffer pointer duplicate — no serialization, no string formatting.
+
+### 7. Raw JSON Parser (no Jackson, no reflection)
+
+`RequestParser` works directly on the raw bytes Netty gives it. No String creation, no object mapping, no regex:
+
+- Copies the ~500-byte body into a thread-local `byte[]` once (one `memcpy`)
+- Scans for field names as byte patterns
+- Parses numbers and timestamps with pure integer arithmetic
+
+ISO-8601 timestamp to epoch-minutes conversion uses Tomohiko Sakamoto's day-of-week formula — about 10 integer operations, no Date or Calendar objects.
+
+### 8. JIT Warmup Before Accepting Traffic
+
+HotSpot's C2 compiler produces the fastest code but only kicks in after a method has been called enough times. The server runs 10,000 synthetic K-NN queries before signaling readiness:
+
+```java
+for (int i = 0; i < 10_000; i++) {
+    // fill vec with XorShift64 random values (no allocation)
+    KnnSearch.searchIVF(store, vec, vecInt8, topDist, topIdx, nprobe);
 }
 ```
 
-**How it improves over time within a query:**
-- First K=5 vectors: no threshold yet → full 14-dim scan
-- After 5 vectors found: `threshold = worstDist` → vectors rejected after avg ~7 dims
-- As better neighbors are found: `threshold` narrows → vectors rejected after avg ~3 dims
+After warmup, `distSqInt8` and `searchIVF` are C2-compiled to native SIMD code. With the production JVM flags (`-XX:Tier4CompileThreshold=250`), C2 kicks in after just 250 invocations — the warmup loop covers that many times over.
 
-Savings: **30–50% fewer dimension comparisons** in a typical query once the top-5 heap is reasonably full.
+### 9. Epoll + Netty Direct IO
 
----
+On Linux, Netty uses the kernel's `epoll` interface instead of Java NIO's selector model. This removes a layer of translation between kernel events and Java code. At 400+ requests/second per instance, the saved overhead adds up.
 
-### 4. `sun.misc.Unsafe` for Off-Heap Access
+### 10. Serial GC and Fixed Heap
 
-Vectors and labels live in native memory allocated with `ByteBuffer.allocateDirect()`. Access goes through `Unsafe.getByte(address)` — **no Java bounds check, no virtual dispatch**:
-
-```java
-// Address computed once per vector — single pointer arithmetic
-final long base = vectorsAddr + (long)idx * VEC_STRIDE;  // VEC_STRIDE = 14
-UNSAFE.getByte(base + d)  // raw C-like memory read
-```
-
-Compared to a heap `byte[][]` approach:
-- No GC scanning of 3M objects
-- Better CPU cache behaviour (contiguous memory)
-- No object header overhead (12–16 bytes per array)
-
----
-
-### 5. Epoll Transport on Linux ⭐⭐
-
-In production, Netty automatically switches to the Linux Epoll transport instead of Java NIO's selector:
-
-```java
-final boolean useEpoll = Epoll.isAvailable(); // true on Linux containers
-final IoHandlerFactory ioFactory = useEpoll
-    ? EpollIoHandler.newFactory()
-    : NioIoHandler.newFactory();
-final Class<? extends ServerChannel> channelClass = useEpoll
-    ? EpollServerSocketChannel.class
-    : NioServerSocketChannel.class;
-```
-
-Epoll eliminates the `epoll_wait` → `selector.select()` → demultiplex overhead of Java NIO. At high concurrency (~400 rps per instance), this saves ~15% in I/O latency.
-
----
-
-### 6. Zero-Allocation Hot Path ⭐⭐⭐
-
-Every scratch buffer that would be allocated per-request is stored in `ThreadLocal`s, initialized **once** per I/O thread during the first request:
-
-```java
-// KnnSearch.java
-static final ThreadLocal<float[]> TL_DIST       = ThreadLocal.withInitial(() -> new float[5]);
-static final ThreadLocal<int[]>   TL_IDX        = ThreadLocal.withInitial(() -> new int[5]);
-static final ThreadLocal<byte[]>  TL_VEC_INT8   = ThreadLocal.withInitial(() -> new byte[14]);
-static final ThreadLocal<float[]> TL_PROBE_DIST = ThreadLocal.withInitial(() -> new float[128]);
-static final ThreadLocal<int[]>   TL_PROBE_IDX  = ThreadLocal.withInitial(() -> new int[128]);
-
-// RequestParser.java
-static final ThreadLocal<float[]> TL_VEC = ThreadLocal.withInitial(() -> new float[14]);
-```
-
-With 2 worker threads per instance, these arrays are allocated exactly **twice** per JVM — not once per request. Heap allocation in the hot path after warmup: **zero bytes**.
-
-The only unavoidable per-request object: `DefaultFullHttpResponse` (Netty HTTP/1.1 framing). Its cost is amortized by `PooledByteBufAllocator`.
-
----
-
-### 7. Pre-encoded Static Responses
-
-The fraud score is always `n/5` for `n ∈ {0,1,2,3,4,5}`. All 6 JSON responses are encoded into static `Unpooled.directBuffer` objects at startup:
-
-```java
-private static final ByteBuf[] RESPONSES = {
-    staticBuf("{\"approved\":true,\"fraud_score\":0.0}"),   // fraudCount = 0
-    staticBuf("{\"approved\":true,\"fraud_score\":0.2}"),   // fraudCount = 1
-    staticBuf("{\"approved\":true,\"fraud_score\":0.4}"),   // fraudCount = 2
-    staticBuf("{\"approved\":false,\"fraud_score\":0.6}"),  // fraudCount = 3
-    staticBuf("{\"approved\":false,\"fraud_score\":0.8}"),  // fraudCount = 4
-    staticBuf("{\"approved\":false,\"fraud_score\":1.0}"),  // fraudCount = 5
-};
-```
-
-Response encoding cost per request: **1 array lookup + 1 `ByteBuf.duplicate()`** (shallow copy of pointer/length — no byte copying).
-
----
-
-### 8. Zero-Copy JSON Parser
-
-`RequestParser` scans the raw Netty `ByteBuf` directly — no `String` creation, no Jackson, no POJO mapping:
+With near-zero allocation in the hot path, GC pauses are tiny regardless of collector. `SerialGC` wins because it uses **zero GC threads** — critical when the container has 0.475 CPU to share between the JVM, GC, and Netty's 2 IO threads:
 
 ```
-Technique                      Allocation?   Cost
-─────────────────────────────────────────────────
-buf.getByte(i)                 none          ~1 ns
-Pattern scan (indexOf)         none          O(n) byte compare
-readFloat() from raw bytes     none          ~5 ns per number
-read2()/read4Digits()          none          2–4 getByte + arithmetic
-isoToEpochMin() timestamp      none          ~10 integer ops
-merchantKnown() comparison     none          byte-by-byte in buffer
+-XX:+UseSerialGC      # no GC thread overhead
+-Xms100m -Xmx100m    # fixed heap, pre-touched — no resize pauses ever
+-XX:+AlwaysPreTouch   # all heap pages faulted in at startup, not during requests
 ```
 
-**ISO-8601 timestamp parsing** without `DateTimeFormatter` or any Date object:
-```java
-// "2026-03-11T20:23:35Z" → epoch minutes, pure integer arithmetic
-private static long isoToEpochMin(ByteBuf buf, int pos) {
-    int y  = read2(buf, pos) * 100 + read2(buf, pos+2);   // 2026
-    int mo = read2(buf, pos+5);                            // 03
-    int d  = read2(buf, pos+8);                            // 11
-    int h  = read2(buf, pos+11);                           // 20
-    int mi = read2(buf, pos+14);                           // 23
-    return epochMin(y, mo, d, h, mi);   // Gregorian calendar arithmetic
-}
-```
+### 11. PooledByteBufAllocator
 
-**Day-of-week** uses Tomohiko Sakamoto's formula — no Calendar, no lookup table beyond a 12-entry switch.
-
----
-
-### 9. JIT Warmup — 10,000 Queries Before `READY = true`
-
-HotSpot's C2 compiler triggers at `~10,000` method invocations (with `CompileThreshold=1000`). The server runs a synthetic workload before accepting real traffic, ensuring all hot paths are at peak C2 optimization:
-
-```java
-private static void warmup(final OffHeapVectorStore store) {
-    final float[] vec     = new float[14];
-    final byte[]  vecInt8 = new byte[14];
-    final float[] topDist = new float[5];
-    final int[]   topIdx  = new int[5];
-
-    long seed = 0x9E3779B97F4A7C15L;  // XorShift64 — no allocation, deterministic
-
-    for (int i = 0; i < 10_000; i++) {
-        for (int d = 0; d < 14; d++) {
-            seed ^= seed << 13; seed ^= seed >>> 7; seed ^= seed << 17;
-            vec[d] = Float.intBitsToFloat(((int)(seed >>> 41) & 0x007FFFFF) | 0x3F800000) - 1f;
-        }
-        KnnSearch.quantize(vec, vecInt8);
-        KnnSearch.searchIVF(store, vec, vecInt8, topDist, topIdx, store.defaultNprobe);
-    }
-}
-```
-
-Methods warmed up: `distSqInt8`, `centDistSq`, `insertProbe`, `insert`, `searchIVF`, `fraudCount` — all the hot path.
-
----
-
-### 10. Aggressive JVM Flags
-
-```bash
--server                          # enable server JIT (default in JDK 25, explicit for clarity)
--XX:+UseSerialGC                 # no GC threads — single-threaded stop-the-world
-                                 # correct for: small heap + low allocation rate + 0.5 CPU
--Xms64m -Xmx64m                 # heap pre-allocated at startup — no GC expansion pause ever
--XX:+AlwaysPreTouch              # touch all heap pages at JVM init — no page fault at request time
--XX:+TieredCompilation           # C1 → C2 compilation pipeline
--XX:CompileThreshold=1000        # reach C2 after 1000 invocations (default: 10000)
--XX:Tier4CompileThreshold=500    # C2 (tier 4) compiled sooner for the hottest methods
--XX:+DoEscapeAnalysis            # scalar-replace short-lived objects onto the stack
--XX:+EliminateAllocations        # elide allocations that escape analysis confirms safe
--XX:+DisableExplicitGC           # ignore any System.gc() calls from libraries
--Dio.netty.allocator.type=pooled # force pool allocator even if heuristics say unpooled
--Dio.netty.recycler.maxCapacityPerThread=4096  # increase object recycler capacity
-```
-
-Why `SerialGC` over `G1` or `ZGC`? With `-Xmx64m` and near-zero allocation in the hot path, GC pauses are negligible regardless. `SerialGC` saves ~3 threads of CPU time vs `G1GC` — critical at 0.5 CPU per instance.
-
----
-
-### 11. SIMD Distance — JDK Vector API
-
-`SimdDistance` uses `jdk.incubator.vector` (JEP 508, 10th incubator in JDK 25) for AVX2/AVX-512 float32 distance. Used in **Phase 1** (centroid scanning, float32 on heap):
-
-```java
-static final VectorSpecies<Float> SPECIES = FloatVector.SPECIES_PREFERRED;
-// SPECIES_PREFERRED selects widest SIMD width at runtime:
-//   SSE4:   128-bit → 4 lanes
-//   AVX2:   256-bit → 8 lanes  ← typical on x86 since 2013
-//   AVX-512: 512-bit → 16 lanes
-
-static float distSq(final float[] a, final float[] b) {
-    var acc = FloatVector.zero(SPECIES);
-    // Full-width passes (no masked load — uses JIT fast intrinsic path)
-    for (int i = 0; i <= BOUND; i += LANES) {
-        var d = FloatVector.fromArray(SPECIES, a, i)
-                           .sub(FloatVector.fromArray(SPECIES, b, i));
-        acc = d.fma(d, acc);   // fused: d² + acc — 1 instruction, 1 rounding
-    }
-    float sum = acc.reduceLanes(VectorOperators.ADD);
-    // Scalar tail for remaining dims (DIMS=14, LANES=8 → 6 scalar ops)
-    for (int i = TAIL_START; i < DIMS; i++) { float d = a[i]-b[i]; sum += d*d; }
-    return sum;
-}
-```
-
-For 512 centroids × 14 dims: **7,168 float ops per query** in Phase 1 — negligible compared to Phase 2.
-
----
-
-### 12. PooledByteBufAllocator
+Netty's pooled buffer allocator reuses memory for HTTP request/response frames across requests, avoiding a `malloc`/`free` cycle per request.
 
 ```java
 .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
 ```
 
-Netty's pooled allocator reuses `ByteBuf` memory across requests via thread-local pool arenas. Without it, each HTTP response body triggers a `malloc`/`free` cycle, adding GC pressure.
+---
+
+## Challenges Faced and Solved
+
+### Challenge 1 — Health Check Race Condition on Container Restart
+
+**Problem:** Docker Compose uses `test -f /tmp/ready` as the health check. The file persists across container restarts if the container exits uncleanly. On restart, a new JVM would still be loading its 42 MB dataset when the health check passed, causing HAProxy (during testing) to route live requests to an instance returning 503 for 30-90 seconds.
+
+**Fix:** Delete `/tmp/ready` as the very first thing on startup, before doing anything else:
+
+```java
+// Wipe any leftover ready file from a previous container run so the
+// health check can't pass before this JVM has actually finished loading.
+Files.deleteIfExists(Paths.get("/tmp/ready"));
+```
+
+This one-liner prevented a class of "works on first run, breaks on redeploy" bugs.
 
 ---
 
-## Memory Layout per Instance
+### Challenge 2 — HAProxy OOM Under Load
 
-```
-────────────────────────────────────────────────────────
- Region               Location    Size      Notes
-────────────────────────────────────────────────────────
- INT8 vectors         off-heap    ~40 MB    3M × 14 bytes, ByteBuffer.allocateDirect
- Labels               off-heap     ~3 MB    3M × 1 byte,  ByteBuffer.allocateDirect
- Float32 centroids    on-heap     ~28 KB    512 × 14 × 4 bytes
- IVF offsets/sizes    on-heap      ~4 KB    512 ints each
- JVM heap (-Xmx64m)  on-heap      64 MB    app + Netty + JIT data structures
- JVM native overhead  native      ~40 MB    JIT code cache, class metadata, threads
-────────────────────────────────────────────────────────
- Total                           ~149 MB    ✓ within 167 MB container limit
-────────────────────────────────────────────────────────
+**Problem:** During experimentation with HAProxy as the load balancer, the container was given 20 MB of memory. The default `maxconn 65535` with 16 KB per-connection buffers means 200 concurrent connections × 32 KB (send + recv) = 6.4 MB in buffers alone, plus HAProxy's 14–15 MB baseline process size. Result: container gets OOM-killed by the kernel, all requests fail.
+
+**Fix:** Set realistic limits that fit the memory budget:
+
+```haproxy
+global
+    maxconn 4096        # contest load is hundreds, not tens of thousands
+    tune.bufsize 8192   # 8 KB buffers: 200 conns × 16 KB = 3.2 MB — safe in 30 MB
 ```
 
 ---
 
-## Binary Format V4 — `references.bin`
+### Challenge 3 — Response Corruption with `option http-reuse always`
 
-Generated once during `docker build` by `ReferenceConverter`. Loaded at startup by `VectorLoader` in ~1 second.
+**Problem:** Adding `option http-reuse always` to HAProxy caused a catastrophic score regression (from ~4300 to ~2273). This option tells HAProxy to reuse idle backend connections across different clients. With Netty's asynchronous `writeAndFlush`, the previous response might not have fully left the socket before HAProxy hands the same connection to the next client. The second client receives a mix of two responses.
+
+**Fix:** Remove `option http-reuse always` entirely. Stick with the default keep-alive behavior, which only reuses a connection for requests from the same client.
+
+This was the hardest bug to diagnose because the symptom (corrupt responses → wrong fraud scores → lower detection score) looked nothing like the cause (HTTP connection reuse). Finding it required cross-referencing the score drop with every change made to the HAProxy config in that session.
+
+---
+
+### Challenge 4 — Stale Binary After Switching from C=512 to C=1024
+
+**Problem:** Increasing the cluster count from 512 to 1024 changes the `references.bin` format (the header records C). Running the server with old binary + new code (or vice versa) produces wrong results silently — the IVF lists point to wrong memory regions.
+
+**Fix:** Always rebuild the binary when changing `ReferenceConverter.C`. The Dockerfile handles this automatically in Stage 2: it runs the converter as part of every image build, so the binary and the app are always in sync. For local testing, back up the old binary and re-run the converter manually before benchmarking.
+
+---
+
+## Resource Budget
 
 ```
-Offset   Size    Field
-──────────────────────────────────────────────────────────
-0        4       magic    = 0x52494E48  ("RINH", little-endian)
-4        4       version  = 4
-8        4       count    = N           (3,000,000)
-12       4       dims     = 14
-16       4       clusters = C           (512)
-20       4       nprobe   = 32          (default at query time)
-24       8       reserved = 0
-──────────────────────────────────────────────────────────
-32       N×14    INT8 vectors           (cluster-ordered)
-32+N×14  N×1     Labels                 (cluster-ordered, 0=legit 1=fraud)
-+N×C×56  C×56    Centroids              (C × 14 × float32 LE)
-+C×4     C×4     Cluster sizes          (int32 LE)
-──────────────────────────────────────────────────────────
-Total: ~46 MB (vs 284 MB uncompressed JSON / 16 MB gzipped)
+Component   CPU       Memory   Notes
+──────────────────────────────────────────────────────────────────
+nginx       0.05      12 MB    Proxy only, no business logic
+api1        0.475    169 MB    Full 3M vector index in RAM
+api2        0.475    169 MB    Full 3M vector index in RAM
+──────────────────────────────────────────────────────────────────
+Total       1.000    350 MB    ✓ exactly within contest limits
 ```
 
-No `listData[]` array in V4 (eliminated by cluster-ordering) → saves `N × 4 = 12 MB` vs V3.
+Memory breakdown per API instance:
+
+```
+vectors (INT8 byte[])    42 MB    3M × 14 bytes, on-heap flat array
+labels  (byte[])          3 MB    3M × 1 byte,   on-heap flat array
+centroids (float[])       0.1 MB  1024 × 14 × 4 bytes
+JVM heap (-Xmx100m)     100 MB    Netty buffers + app code + JIT data
+JVM native overhead      ~24 MB   Metaspace, thread stacks, native code
+──────────────────────────────────────────────────────────────────
+Total                   ~170 MB   ✓ within 169 MB container limit
+```
+
+---
+
+## Binary Format — `references.bin` (V4)
+
+Generated once during `docker build` by `ReferenceConverter`. Never changes at runtime.
+
+```
+Bytes        Field         Value
+───────────────────────────────────────────────────────
+0–3          magic         0x52494E48  ("RINH")
+4–7          version       4
+8–11         count N       3,000,000
+12–15        dims          14
+16–19        clusters C    1024
+20–23        nprobe        8  (default; overridden by NPROBE env var)
+24–31        reserved      0
+───────────────────────────────────────────────────────
+32 ..        INT8 vectors  N × 14 bytes, in cluster order
+.. + N       labels        N bytes (0 = legit, 1 = fraud), cluster order
+.. + C×56    centroids     C × 14 × float32, little-endian
+.. + C×4     cluster sizes C × int32, little-endian
+───────────────────────────────────────────────────────
+Total: ~43 MB  (vs 168 MB float32 / 284 MB uncompressed JSON)
+```
+
+No `listData[]` in V4 — cluster-ordering eliminates the need for an indirection array, saving 12 MB versus V3.
 
 ---
 
 ## Build Process
 
-The Docker build has **3 stages**:
-
 ```
-Stage 1 — maven:3.9-eclipse-temurin-25 (builder)
+Stage 1 — maven:3.9-eclipse-temurin-25
   └─ mvn package -DskipTests
-     └─ Compiles all Java, produces fat JAR (~8 MB)
+     Compiles Java source, produces fat JAR (~8 MB)
 
-Stage 2 — eclipse-temurin:25-jre (converter)
+Stage 2 — eclipse-temurin:25-jre  (the slow part)
   └─ java org.rinha.ReferenceConverter references.json.gz references.bin
-     ├─ Parse 3M JSON vectors           (~30s)
-     ├─ K-means C=512, 15 iterations    (~3–8 min depending on CPU)
-     ├─ Build IVF lists + quantize      (~10s)
-     └─ Write V4 binary (~46 MB)        (~5s)
+     1. Parse 3M JSON vectors              ~45 s
+     2. K-means C=1024, 15 iterations      ~30 s  (parallel across all cores)
+     3. Build cluster offsets + bboxes     ~5 s
+     4. Write V4 binary                    ~5 s
+     Total:                               ~85 s on a 4-core machine
 
-Stage 3 — eclipse-temurin:25-jre (runtime)
+Stage 3 — eclipse-temurin:25-jre  (runtime image)
   └─ COPY app.jar + references.bin
-     └─ java [JVM flags] org.rinha.Main
-        ├─ VectorLoader.loadOffHeap()   (~1s, mmap-speed read)
-        ├─ JIT warmup 10k queries       (~3s)
-        └─ READY → accept traffic
+     java [JVM flags] org.rinha.Main
+     1. VectorLoader.loadOffHeap()         ~1 s  (read 43 MB from disk)
+     2. buildBboxes()                      ~0.5 s
+     3. JIT warmup (10k synthetic queries) ~4 s
+     → signal READY, start accepting traffic
 ```
 
 ---
@@ -433,29 +363,24 @@ Stage 3 — eclipse-temurin:25-jre (runtime)
 ## Running Locally
 
 ```bash
-# 1. Get the dataset (from the official contest repo)
+# 1. Get the dataset (if you don't have it already)
 curl -L -o resources/references.json.gz \
   https://github.com/zanfranceschi/rinha-de-backend-2026/raw/main/resources/references.json.gz
 
 # 2. Build for linux/amd64 (required if you're on macOS ARM)
-docker buildx build \
-  --platform linux/amd64 \
-  -t carlosportella16/rinha-2026:latest \
-  --push \
-  .
+docker buildx build --platform linux/amd64 \
+  -t carlosportella16/rinha-2026:latest --push .
 
-# 3. Start the stack (nginx + api1 + api2)
+# 3. Start the stack
 docker compose up
 
-# 4. Health check
-curl -s http://localhost:9999/ready
-# → OK
+# 4. Verify it's up
+curl -s http://localhost:9999/ready   # → OK
 
 # 5. Test fraud detection
 curl -s -X POST http://localhost:9999/fraud-score \
   -H "Content-Type: application/json" \
   -d '{
-    "id": "tx-test",
     "transaction": {"amount": 9500.0, "installments": 10, "requested_at": "2026-03-14T05:15:12Z"},
     "customer": {"avg_amount": 81.0, "tx_count_24h": 20, "known_merchants": ["MERC-008"]},
     "merchant": {"id": "MERC-999", "mcc": "7995", "avg_amount": 54.0},
@@ -463,6 +388,10 @@ curl -s -X POST http://localhost:9999/fraud-score \
     "last_transaction": null
   }'
 # → {"approved":false,"fraud_score":1.0}
+
+# 6. Run the local benchmark
+./benchmark.sh           # builds + runs
+./benchmark.sh --no-build  # skips mvn, re-uses last JAR
 ```
 
 ---
@@ -473,59 +402,28 @@ curl -s -X POST http://localhost:9999/fraud-score \
 rinha-backend-2026/
 │
 ├── src/main/java/org/rinha/
-│   ├── Main.java                # Netty bootstrap: Epoll/NIO, boss+2 workers, /ready + /fraud-score
-│   ├── RequestParser.java       # Zero-alloc JSON parser: raw ByteBuf byte scan, ISO-8601 arithmetic
-│   ├── KnnSearch.java           # IVF search (searchIVF), quantize(), fraudCount(), ThreadLocals
-│   ├── OffHeapVectorStore.java  # Off-heap INT8 store: distSqInt8 with early-exit, Unsafe access
-│   ├── VectorLoader.java        # Binary loader: V2 (float32 legacy), V3 (IVF+INT8), V4 (cluster-ordered)
-│   ├── ReferenceConverter.java  # Build-time: JSON.gz → V4 binary (parallel k-means + quantization)
-│   ├── SimdDistance.java        # JDK Vector API: float32 DistSq with AVX2/AVX-512 intrinsics
-│   ├── VectorStore.java         # On-heap float32 store + dim-0 sorted index (used in tests)
-│   └── DistanceBenchmark.java   # Micro-benchmark: SIMD vs scalar distSq
+│   ├── Main.java               Netty server: Epoll/NIO, /ready + /fraud-score handlers
+│   ├── RequestParser.java      Raw byte JSON parser, ISO-8601 math, MCC lookup
+│   ├── KnnSearch.java          IVF search, INT8 SIMD distance, ThreadLocal scratch buffers
+│   ├── OffHeapVectorStore.java Flat byte[] store with per-cluster bounding boxes
+│   ├── VectorLoader.java       Binary loader: V2 legacy / V3 IVF / V4 cluster-ordered
+│   ├── ReferenceConverter.java Build-time: JSON.gz → k-means → V4 binary
+│   ├── SimdDistance.java       Float32 SIMD distSq for the VectorStore test path
+│   └── VectorStore.java        On-heap float32 store used in unit tests
 │
 ├── src/test/java/org/rinha/
-│   └── KnnSearchTest.java       # Correctness tests: IVF recall vs brute-force
+│   └── KnnSearchTest.java      Correctness tests: insert, search, fraudCount, spec examples
 │
-├── Dockerfile                   # 3-stage build: compile → k-means → runtime
-├── docker-compose.yml           # nginx + api1 + api2 with resource limits
-├── nginx.conf                   # Upstream keepalive, epoll, tcp_nodelay, access_log off
-├── pom.xml                      # Java 25, Netty 4.2, maven-shade, Vector API compile flag
-├── info.json                    # Participant metadata
-├── participants/
-│   └── carlosportella16.json    # Registration file for the official contest repo
-└── benchmark-results/           # Local benchmark runs (gitignored in submission)
+├── Dockerfile                  3-stage build: compile → k-means → runtime
+├── docker-compose.yml          nginx + api1 + api2 with resource limits
+├── nginx.conf                  Upstream keepalive, epoll, access_log off
+├── pom.xml                     Java 25, Netty 4.2, Panama Vector API compile flag
+├── benchmark.sh                Local benchmark: build → start server → correctness + load test
+└── info.json                   Contest participant metadata
 ```
-
----
-
-## Resource Distribution
-
-```yaml
-# docker-compose.yml
-nginx:  cpus: "0.05"   memory: "16MB"   # proxy only — no business logic
-api1:   cpus: "0.475"  memory: "167MB"
-api2:   cpus: "0.475"  memory: "167MB"
-# ──────────────────────────────────────
-# Total: 1.00 CPU / 350 MB  ✓
-```
-
----
-
-## Pending Optimizations
-
-The following improvements are identified but not yet implemented:
-
-| # | Optimization | Expected gain | Complexity |
-|---|-------------|--------------|-----------|
-| A | Reorder dims by variance (early-exit fires earlier) | +10–30% Phase 2 speed | Medium |
-| B | `ByteVector` SIMD for INT8 off-heap distance (Phase 2) | +30–50% Phase 2 speed | High |
-| C | `mmap` shared between instances (save ~45 MB RAM) | −45 MB physical RAM | Medium |
-| D | Eliminate `try/catch` in `RequestParser.parse()` (C2 inlining) | +5–10% parse | Low |
-| E | Warmup using real centroid vectors instead of XorShift random | Better JIT branch prediction | Low |
 
 ---
 
 ## License
 
 MIT
-

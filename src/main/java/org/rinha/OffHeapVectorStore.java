@@ -1,24 +1,19 @@
 package org.rinha;
 
 /**
- * IVF vector store with cluster-ordered flat byte[] storage.
+ * The vector index used at runtime.
  *
- * Memory layout (V4 / cluster-ordered):
- *   vectors:  N × 14 bytes (INT8, on-heap flat array) — 42 MB for 3M vecs
- *   labels:   N bytes      (on-heap flat array)        —  3 MB for 3M vecs
+ * Despite the name, everything here lives in regular on-heap byte[] arrays —
+ * not off-heap. The name is historical. The benefit over a float[][] approach
+ * is that one flat byte[] has no per-object overhead and lets the CPU
+ * prefetcher work ahead through the data during Phase 2 scanning.
  *
- * In V4 (and V3 after load-time reorder), vectors[c_off * DIMS .. (c_off + c_sz) * DIMS)
- * holds every vector of cluster c contiguously — no indirection, simple index arithmetic,
- * prefetcher-friendly sequential stride of VEC_STRIDE bytes.
- *
- * IVF index arrays (on-heap):
- *   centroids:   C × DIMS floats = 28 KB for C=512
- *   listOffsets: C ints          =  2 KB   (vector index, not byte offset)
- *   listSizes:   C ints          =  2 KB
- *   listData:    null — always null after cluster-ordered layout is established
+ * Vectors and labels are stored in cluster order so that scanning all vectors
+ * in cluster c is a simple sequential read:
+ *   vectors[ listOffsets[c] * DIMS  ..  (listOffsets[c] + listSizes[c]) * DIMS )
  *
  * INT8 encoding: float f → byte = round(f × 127), clamped to [-127, 127].
- * Sentinel -1.0 → -127.
+ * The sentinel value -1.0 (used for "no previous transaction") maps to -127.
  */
 final class OffHeapVectorStore {
 
