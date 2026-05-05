@@ -36,7 +36,7 @@ CMD java \
     --add-opens java.base/sun.misc=ALL-UNNAMED \
     --sun-misc-unsafe-memory-access=allow \
     -XX:+UseSerialGC \
-    -Xms120m -Xmx120m \
+    -Xms128m -Xmx128m \
     -XX:+AlwaysPreTouch \
     -XX:+TieredCompilation \
     -XX:CompileThreshold=500 \
@@ -53,5 +53,5 @@ CMD java \
     -Dio.netty.allocator.type=pooled \
     -Dio.netty.recycler.maxCapacityPerThread=4096 \
     -Dio.netty.allocator.numHeapArenas=2 \
-    -Dio.netty.allocator.numDirectArenas=1 \
+    -Dio.netty.allocator.numDirectArenas=2 \
     -cp /app/app.jar org.rinha.Main

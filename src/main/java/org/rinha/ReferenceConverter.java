@@ -37,9 +37,9 @@ import java.util.zip.GZIPInputStream;
  */
 public final class ReferenceConverter {
 
-    static final int C             = 1024;  // number of IVF clusters
-    static final int MAX_ITER      = 15;    // k-means iterations
-    static final int DEFAULT_NPROBE = 8;    // nprobe=8: excellent recall (~99.5%+) still well under 1ms per query
+    static final int C              = 1024;  // number of IVF clusters
+    static final int MAX_ITER       = 20;   // k-means iterations (more → tighter clusters → better bbox pruning)
+    static final int DEFAULT_NPROBE = 4;    // nprobe=4: good recall with lower scan cost per request
     static final int HEADER_BYTES  = 32;    // v4 header size (same as v3)
 
     public static void main(String[] args) throws Exception {

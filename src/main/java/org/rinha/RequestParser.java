@@ -101,16 +101,21 @@ final class RequestParser {
 
     private static void doParseBytes(final byte[] b, final int end, final float[] v) {
 
+        // ── SINGLE forward scan strategy ─────────────────────────────────────
+        // Each section search starts where the previous one ended → no byte is
+        // scanned more than twice. Total bytes examined ≈ 2 × body_length.
+
         // ── transaction ──────────────────────────────────────────────────────
         final int txOpen  = sectionOpen(b, 0, end, K_TRANSACTION);
         final int txClose = braceClose(b, txOpen, end);
 
+        // Fields searched in declaration order (forward only within section)
         final float txAmount     = readFloat(b, valAt(b, txOpen, txClose, K_AMOUNT));
         final int   installments = readInt  (b, valAt(b, txOpen, txClose, K_INSTALLMENTS));
-        // +1 skips the opening '"' of the timestamp string
         final int   reqAtPos     = valAt(b, txOpen, txClose, K_REQUESTED_AT) + 1;
 
         // ── customer ─────────────────────────────────────────────────────────
+        // Start search from txClose (not from 0) — avoids rescanning transaction
         final int custOpen  = sectionOpen(b, txClose, end, K_CUSTOMER);
         final int custClose = braceClose(b, custOpen, end);
 
@@ -123,7 +128,6 @@ final class RequestParser {
         final int merchOpen  = sectionOpen(b, custClose, end, K_MERCHANT);
         final int merchClose = braceClose(b, merchOpen, end);
 
-        // +1 skips the opening '"' of the id string
         final int   midPos  = valAt(b, merchOpen, merchClose, K_MERCH_ID) + 1;
         final int   midLen  = stringLen(b, midPos, merchClose);
         final int   mccPos  = valAt(b, merchOpen, merchClose, K_MCC) + 1;
@@ -139,6 +143,7 @@ final class RequestParser {
         final float   kmFromHome  = readFloat(b, valAt(b, termOpen, termClose, K_KM_FROM_HOME));
 
         // ── last_transaction ─────────────────────────────────────────────────
+        // Search only from termClose forward — avoids rescanning earlier sections
         final int     ltKeyPos = indexOf(b, termClose, end, K_LAST_TX);
         final int     ltValPos = skipToValue(b, ltKeyPos + K_LAST_TX.length, end);
         final boolean hasLast  = b[ltValPos] != 'n'; // not "null"
@@ -149,7 +154,6 @@ final class RequestParser {
         if (hasLast) {
             final int ltOpen  = sectionOpen2(b, ltValPos, end);
             final int ltClose = braceClose(b, ltOpen, end);
-            // +1 skips the opening '"' of the timestamp string
             final int   tsPos  = valAt(b, ltOpen, ltClose, K_TIMESTAMP) + 1;
             final float kmCurr = readFloat(b, valAt(b, ltOpen, ltClose, K_KM_FROM_CURRENT));
 
@@ -166,7 +170,6 @@ final class RequestParser {
         // ── assemble 14-dim vector ────────────────────────────────────────────
         v[0]  = clamp(txAmount / MAX_AMOUNT);
         v[1]  = clamp(installments / MAX_INSTALL);
-        // Guard against custAvg=0: 0/0=NaN would produce wrong vector; use 0.0 instead
         v[2]  = (custAvg == 0f) ? 0f : clamp((txAmount / custAvg) / AMT_AVG_RATIO);
         v[3]  = isoHour(b, reqAtPos) / 23f;
         v[4]  = isoDOW (b, reqAtPos) / 6f;
